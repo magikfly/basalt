@@ -1,15 +1,22 @@
 name: basalt-image
 
-# Fork-local pipeline. Publishes the container image this box actually runs.
+# Fork-local pipeline. Publishes the container image this box runs.
 #
 # Daily at 03:00 Europe/Amsterdam it asks upstream (jesdga95/basalt) for its
-# current main commit. If that commit already has a tag in GHCR nothing is
-# rebuilt; otherwise upstream is merged into this fork's main, the engine is
-# compiled for sm_120, and ghcr.io/magikfly/basalt:latest moves to the new build.
+# current main commit. If that commit is already merged here AND already has a tag
+# in GHCR, nothing is rebuilt. Otherwise upstream is merged into this fork's main,
+# the engine is compiled for sm_120, and ghcr.io/magikfly/basalt:latest moves to
+# the new build.
 #
 # The gate keys on the upstream commit SHA, not a release tag: upstream publishes
 # no tags and no releases. Keying on a version tag is how a mnemory deploy once
-# silently no-oped, so an unrecognised registry answer means "build", not "skip".
+# silently no-oped, so an inconclusive registry answer means "build", not "skip".
+#
+# The registry check goes through `docker buildx imagetools inspect` after
+# `docker login`, NOT a raw curl to ghcr.io: curl with basic auth using
+# GITHUB_TOKEN returns 401 from these jobs even though the same token pushes
+# successfully minutes later, and that 401 made every run rebuild (measured on
+# run 39850292553).
 #
 # Cron is UTC and ignores TZ. 01:00 UTC is 03:00 in Amsterdam summer time and
 # 02:00 in winter; it drifts by an hour at each DST change.
@@ -64,8 +71,8 @@ jobs:
         id: upstream
         run: |
           git remote add upstream "https://github.com/${UPSTREAM_REPO}.git" 2>/dev/null || true
-          # full fetch: objects we already share with upstream are not re-downloaded,
-          # and a shallow fetch would break merge-base below
+          # full fetch: objects shared with upstream are not re-downloaded, and a
+          # shallow fetch would break merge-base below
           git fetch --no-tags upstream main
           SHA="$(git rev-parse FETCH_HEAD)"
           echo "sha=$SHA"              >> "$GITHUB_OUTPUT"
@@ -78,24 +85,29 @@ jobs:
             echo "upstream $SHA is new to this fork"
           fi
 
+      # Login has to precede the registry check: that is the only GHCR credential
+      # these jobs can actually read with (see the header note).
+      - uses: docker/setup-buildx-action@v4
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
       - name: Look for an image of that commit
         id: published
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          SHA="${{ steps.upstream.outputs.sha }}"
-          AUTH="$(printf '%s:%s' "${{ github.actor }}" "$GH_TOKEN" | base64 -w0)"
-          ACCEPT='application/vnd.oci.image.index.v1+json,application/vnd.docker.distribution.manifest.v2+json,application/vnd.docker.distribution.manifest.list.v2+json'
-          CODE="$(curl -s -o /dev/null -w '%{http_code}' \
-                   -H "Authorization: Basic $AUTH" -H "Accept: $ACCEPT" \
-                   "https://ghcr.io/v2/magikfly/basalt/manifests/upstream-$SHA")"
-          echo "http=$CODE" >> "$GITHUB_OUTPUT"
-          if [ "$CODE" = "200" ]; then
+          TAG="${IMAGE}:upstream-${{ steps.upstream.outputs.sha }}"
+          if docker buildx imagetools inspect "$TAG" >/dev/null 2>&1; then
             echo "exists=true" >> "$GITHUB_OUTPUT"
-            echo "upstream-${SHA:0:12} is already published"
+            echo "$TAG is already published"
           else
+            # missing tag, or the registry could not be consulted. Both mean
+            # "cannot prove it exists", which builds rather than skips.
             echo "exists=false" >> "$GITHUB_OUTPUT"
-            echo "no provable image for upstream-${SHA:0:12} (HTTP $CODE), will build"
+            echo "no provable image for $TAG, will build"
           fi
 
       - name: Decide
@@ -103,15 +115,17 @@ jobs:
         run: |
           if [ "${{ github.event.inputs.force }}" = "true" ]; then
             action=build
-          elif [ "${{ steps.published.outputs.exists }}" = "true" ] && [ "${{ steps.upstream.outputs.merged }}" = "true" ]; then
-            action=skip
+          elif [ "${{ steps.upstream.outputs.merged }}" != "true" ]; then
+            action=build
           elif [ "${{ steps.published.outputs.exists }}" = "true" ]; then
-            action=promote      # image exists, fork main is behind: merge and re-point
+            action=skip
           else
+            # merged but no image: normally impossible, because the merge is only
+            # pushed after a successful publish. Rebuild to close the gap.
             action=build
           fi
           echo "action=$action" >> "$GITHUB_OUTPUT"
-          echo "::notice::action=$action upstream=${{ steps.upstream.outputs.short }}"
+          echo "::notice::action=$action upstream=${{ steps.upstream.outputs.short }} merged=${{ steps.upstream.outputs.merged }} published=${{ steps.published.outputs.exists }}"
 
       - name: Merge upstream into main
         if: steps.decide.outputs.action != 'skip'
@@ -128,17 +142,6 @@ jobs:
             git merge --abort
             exit 1
           fi
-
-      - uses: docker/setup-buildx-action@v4
-        if: steps.decide.outputs.action != 'skip'
-
-      - name: Log in to GHCR
-        if: steps.decide.outputs.action != 'skip'
-        uses: docker/login-action@v4
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build and publish
         if: steps.decide.outputs.action == 'build'
@@ -158,12 +161,6 @@ jobs:
           cache-from: type=gha,scope=basalt-image
           cache-to: type=gha,scope=basalt-image,mode=max
 
-      - name: Re-point latest at the existing build
-        if: steps.decide.outputs.action == 'promote'
-        run: |
-          docker buildx imagetools create -t "${IMAGE}:latest" \
-            "${IMAGE}:upstream-${{ steps.upstream.outputs.sha }}"
-
       - name: Push the merge to main
         if: steps.decide.outputs.action != 'skip'
         run: git push origin HEAD:main
@@ -176,8 +173,9 @@ jobs:
             echo ""
             echo "- action: **${{ steps.decide.outputs.action }}**"
             echo "- upstream commit: \`${{ steps.upstream.outputs.short }}\`"
-            echo "- registry check: HTTP ${{ steps.published.outputs.http }}"
-            if [ "${{ steps.decide.outputs.action }}" != "skip" ]; then
-              echo "- now serving \`${IMAGE}:latest\` = \`upstream-${{ steps.upstream.outputs.short }}\`"
+            echo "- merged into main: ${{ steps.upstream.outputs.merged }}"
+            echo "- image already published: ${{ steps.published.outputs.exists }}"
+            if [ "${{ steps.decide.outputs.action }}" = "build" ]; then
+              echo "- \`${IMAGE}:latest\` now = \`upstream-${{ steps.upstream.outputs.short }}\`"
             fi
           } >> "$GITHUB_STEP_SUMMARY"
