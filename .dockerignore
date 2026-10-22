@@ -1,17 +1,21 @@
-# Keep the build context to source only. The build stage compiles from scratch,
-# so host artifacts here would be dead weight or, worse, stale host binaries
-# copied over the image's own compile.
+# The repository is ~15 MB, so the context is not worth trimming aggressively.
+# CMakeLists.txt declares some test targets outside the BUILD_TESTING guard, so
+# hiding sources/ here breaks `cmake -S .` even with -DBUILD_TESTING=OFF.
+# Exclude only host build residue; keep the tree faithful.
 .git
-.git/
+.gitignore
+.gitattributes
 build/
 build*/
 bin/
 .venv/
 __pycache__/
+**/__pycache__/
 *.pyc
+*.pyo
 *.log
-docs/
-site/
-assets/
-tests/
-data/bench/*.bin
+*.egg-info/
+.pytest_cache/
+.ccache/
+.vscode/
+.idea/

@@ -7,6 +7,11 @@
 # Built by .github/workflows/basalt-image.yml and published to
 # ghcr.io/magikfly/basalt. This file is a fork-local addition; upstream
 # jesdga95/basalt ships no container definition.
+#
+# There is no GPU on a build runner, so nothing here executes the engine. The
+# smoke checks below verify the two things this file can actually get wrong: the
+# runtime image resolving every shared library the engine links, and the Python
+# server importing from the copied tree.
 
 ARG CUDA_DEVEL=nvidia/cuda:13.2.1-devel-ubuntu24.04
 ARG CUDA_RUNTIME=nvidia/cuda:13.2.1-runtime-ubuntu24.04
@@ -26,13 +31,12 @@ WORKDIR /src
 COPY . .
 
 # arch 120 (Blackwell) is the only architecture Basalt builds for; CMakeLists.txt
-# hard-fails on anything else. No GPU is needed to compile.
+# hard-fails on anything else. Compiling needs no GPU.
 RUN cmake -S . -B build -G Ninja \
       -DCMAKE_BUILD_TYPE=Release \
       -DBUILD_TESTING=OFF \
       -DCMAKE_CUDA_ARCHITECTURES=120 \
-    && cmake --build build -j"$(nproc)" \
-    && build/bin/basalt --help >/dev/null
+    && cmake --build build -j"$(nproc)"
 
 # ------------------------------------------------------------- runtime stage
 FROM ${CUDA_RUNTIME} AS runtime
@@ -62,6 +66,12 @@ COPY --from=build /src/tools ./tools/
 COPY --from=build /src/data ./data/
 
 ENV PYTHONPATH=/opt/basalt
+
+RUN set -eux; \
+    unresolved="$(ldd bin/basalt | awk '/not found/ {print}')"; \
+    test -z "$unresolved" || { echo "engine has unresolved libraries in the runtime image:"; echo "$unresolved"; exit 1; }; \
+    test -x bin/basalt; \
+    .venv/bin/python -c "import serve.server, serve.frontend; print('server imports ok')"
 
 # The model pack and basalt_config.json are NOT baked in. Mount them:
 #   -v /path/to/models:/models:ro  -v /path/to/config:/work
