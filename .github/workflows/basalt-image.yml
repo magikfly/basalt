@@ -115,6 +115,8 @@ jobs:
         run: |
           if [ "${{ github.event.inputs.force }}" = "true" ]; then
             action=build
+          elif [ "${{ github.event_name }}" = "push" ]; then
+            action=build   # this trigger fires only on image-defining files; the upstream SHA alone would wrongly skip it
           elif [ "${{ steps.upstream.outputs.merged }}" != "true" ]; then
             action=build
           elif [ "${{ steps.published.outputs.exists }}" = "true" ]; then
