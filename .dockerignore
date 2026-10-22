@@ -1,0 +1,17 @@
+# Keep the build context to source only. The build stage compiles from scratch,
+# so host artifacts here would be dead weight or, worse, stale host binaries
+# copied over the image's own compile.
+.git
+.git/
+build/
+build*/
+bin/
+.venv/
+__pycache__/
+*.pyc
+*.log
+docs/
+site/
+assets/
+tests/
+data/bench/*.bin

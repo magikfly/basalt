@@ -1,0 +1,183 @@
+name: basalt-image
+
+# Fork-local pipeline. Publishes the container image this box actually runs.
+#
+# Daily at 03:00 Europe/Amsterdam it asks upstream (jesdga95/basalt) for its
+# current main commit. If that commit already has a tag in GHCR nothing is
+# rebuilt; otherwise upstream is merged into this fork's main, the engine is
+# compiled for sm_120, and ghcr.io/magikfly/basalt:latest moves to the new build.
+#
+# The gate keys on the upstream commit SHA, not a release tag: upstream publishes
+# no tags and no releases. Keying on a version tag is how a mnemory deploy once
+# silently no-oped, so an unrecognised registry answer means "build", not "skip".
+#
+# Cron is UTC and ignores TZ. 01:00 UTC is 03:00 in Amsterdam summer time and
+# 02:00 in winter; it drifts by an hour at each DST change.
+
+on:
+  schedule:
+    - cron: "0 1 * * *"
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "Rebuild and republish even if the tag already exists"
+        type: boolean
+        default: false
+  push:
+    branches: [main]
+    paths:
+      - "Dockerfile"
+      - ".dockerignore"
+      - ".github/workflows/basalt-image.yml"
+
+permissions:
+  contents: write   # push the upstream merge back to this fork's main
+  packages: write   # publish to ghcr.io/magikfly/basalt
+
+concurrency:
+  group: basalt-image
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_REPO: jesdga95/basalt
+  IMAGE: ghcr.io/magikfly/basalt
+  CUDA_ARCH: "120"
+
+jobs:
+  image:
+    name: Sync upstream and build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0        # the ancestor test below needs real merge bases
+          persist-credentials: true
+
+      - name: Configure git
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Resolve the upstream commit
+        id: upstream
+        run: |
+          git remote add upstream "https://github.com/${UPSTREAM_REPO}.git" 2>/dev/null || true
+          # full fetch: objects we already share with upstream are not re-downloaded,
+          # and a shallow fetch would break merge-base below
+          git fetch --no-tags upstream main
+          SHA="$(git rev-parse FETCH_HEAD)"
+          echo "sha=$SHA"              >> "$GITHUB_OUTPUT"
+          echo "short=${SHA:0:12}"     >> "$GITHUB_OUTPUT"
+          if git merge-base --is-ancestor "$SHA" HEAD; then
+            echo "merged=true"  >> "$GITHUB_OUTPUT"
+            echo "upstream $SHA already in main"
+          else
+            echo "merged=false" >> "$GITHUB_OUTPUT"
+            echo "upstream $SHA is new to this fork"
+          fi
+
+      - name: Look for an image of that commit
+        id: published
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          SHA="${{ steps.upstream.outputs.sha }}"
+          AUTH="$(printf '%s:%s' "${{ github.actor }}" "$GH_TOKEN" | base64 -w0)"
+          ACCEPT='application/vnd.oci.image.index.v1+json,application/vnd.docker.distribution.manifest.v2+json,application/vnd.docker.distribution.manifest.list.v2+json'
+          CODE="$(curl -s -o /dev/null -w '%{http_code}' \
+                   -H "Authorization: Basic $AUTH" -H "Accept: $ACCEPT" \
+                   "https://ghcr.io/v2/magikfly/basalt/manifests/upstream-$SHA")"
+          echo "http=$CODE" >> "$GITHUB_OUTPUT"
+          if [ "$CODE" = "200" ]; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "upstream-${SHA:0:12} is already published"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+            echo "no provable image for upstream-${SHA:0:12} (HTTP $CODE), will build"
+          fi
+
+      - name: Decide
+        id: decide
+        run: |
+          if [ "${{ github.event.inputs.force }}" = "true" ]; then
+            action=build
+          elif [ "${{ steps.published.outputs.exists }}" = "true" ] && [ "${{ steps.upstream.outputs.merged }}" = "true" ]; then
+            action=skip
+          elif [ "${{ steps.published.outputs.exists }}" = "true" ]; then
+            action=promote      # image exists, fork main is behind: merge and re-point
+          else
+            action=build
+          fi
+          echo "action=$action" >> "$GITHUB_OUTPUT"
+          echo "::notice::action=$action upstream=${{ steps.upstream.outputs.short }}"
+
+      - name: Merge upstream into main
+        if: steps.decide.outputs.action != 'skip'
+        run: |
+          SHA="${{ steps.upstream.outputs.sha }}"
+          if [ "${{ steps.upstream.outputs.merged }}" = "true" ]; then
+            echo "nothing to merge"
+            exit 0
+          fi
+          if ! git merge --no-edit --no-ff "$SHA" \
+               -m "Merge upstream $UPSTREAM_REPO main ($SHA)"; then
+            echo "::error::Merge conflict with upstream. Resolve by hand; nothing was built or published."
+            git diff --name-only --diff-filter=U
+            git merge --abort
+            exit 1
+          fi
+
+      - uses: docker/setup-buildx-action@v4
+        if: steps.decide.outputs.action != 'skip'
+
+      - name: Log in to GHCR
+        if: steps.decide.outputs.action != 'skip'
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and publish
+        if: steps.decide.outputs.action == 'build'
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ env.IMAGE }}:latest
+            ${{ env.IMAGE }}:upstream-${{ steps.upstream.outputs.short }}
+            ${{ env.IMAGE }}:upstream-${{ steps.upstream.outputs.sha }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.base.name=nvidia/cuda:13.2.1-runtime-ubuntu24.04
+            ai.basalt.upstream-commit=${{ steps.upstream.outputs.sha }}
+            ai.basalt.cuda-arch=${{ env.CUDA_ARCH }}
+          cache-from: type=gha,scope=basalt-image
+          cache-to: type=gha,scope=basalt-image,mode=max
+
+      - name: Re-point latest at the existing build
+        if: steps.decide.outputs.action == 'promote'
+        run: |
+          docker buildx imagetools create -t "${IMAGE}:latest" \
+            "${IMAGE}:upstream-${{ steps.upstream.outputs.sha }}"
+
+      - name: Push the merge to main
+        if: steps.decide.outputs.action != 'skip'
+        run: git push origin HEAD:main
+
+      - name: Report
+        if: always()
+        run: |
+          {
+            echo "## basalt image"
+            echo ""
+            echo "- action: **${{ steps.decide.outputs.action }}**"
+            echo "- upstream commit: \`${{ steps.upstream.outputs.short }}\`"
+            echo "- registry check: HTTP ${{ steps.published.outputs.http }}"
+            if [ "${{ steps.decide.outputs.action }}" != "skip" ]; then
+              echo "- now serving \`${IMAGE}:latest\` = \`upstream-${{ steps.upstream.outputs.short }}\`"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
