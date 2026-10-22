@@ -8,7 +8,12 @@
 # ghcr.io/magikfly/basalt. This file is a fork-local addition; upstream
 # jesdga95/basalt ships no container definition.
 #
-# Two upstream facts this file depends on:
+# Three upstream facts this file depends on:
+#   - src/program/generate.cpp hardcodes BASALT_SOURCE_DIR (the CMake source
+#     directory, resolved at COMPILE time) and `basalt serve` chdirs into it to
+#     launch the Python server. The build stage therefore compiles in /opt/basalt,
+#     the exact path the runtime image serves from - a mismatch is a hard
+#     `cannot enter the source tree` failure at startup.
 #   - CMakeLists.txt sets RUNTIME_OUTPUT_DIRECTORY to ${CMAKE_SOURCE_DIR}/bin for
 #     basalt, basalt-bench and basalt-probe, so binaries land in the SOURCE tree's
 #     bin/, not build/bin/. basalt-vision comes from add_subdirectory(tools/vision).
@@ -34,7 +39,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-WORKDIR /src
+WORKDIR /opt/basalt
 COPY . .
 
 # arch 120 (Blackwell) is the only architecture Basalt builds for; CMakeLists.txt
@@ -51,7 +56,7 @@ RUN cmake -S . -B build -G Ninja \
 RUN set -eux; \
     mkdir -p /artifacts/bin; \
     for b in basalt basalt-bench basalt-probe basalt-vision; do \
-      src="$(find /src -type f -name "$b" -perm -u+x -printf '%s\t%p\n' | sort -rn | head -1 | cut -f2-)"; \
+      src="$(find /opt/basalt -type f -name "$b" -perm -u+x -printf '%s\t%p\n' | sort -rn | head -1 | cut -f2-)"; \
       test -n "$src" || { echo "MISSING: $b was not produced by the build"; exit 1; }; \
       cp -a "$src" /artifacts/bin/; \
     done; \
@@ -80,9 +85,9 @@ RUN python3 -m venv /opt/basalt/.venv \
 # serve/ adds its own parent and a sibling tools/ dir to sys.path, so the
 # repo-root layout has to be preserved.
 COPY --from=build /artifacts/bin/ ./bin/
-COPY --from=build /src/serve ./serve/
-COPY --from=build /src/tools ./tools/
-COPY --from=build /src/data ./data/
+COPY --from=build /opt/basalt/serve ./serve/
+COPY --from=build /opt/basalt/tools ./tools/
+COPY --from=build /opt/basalt/data ./data/
 
 ENV PYTHONPATH=/opt/basalt
 
