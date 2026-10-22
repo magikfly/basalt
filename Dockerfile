@@ -8,10 +8,17 @@
 # ghcr.io/magikfly/basalt. This file is a fork-local addition; upstream
 # jesdga95/basalt ships no container definition.
 #
+# Two upstream facts this file depends on:
+#   - CMakeLists.txt sets RUNTIME_OUTPUT_DIRECTORY to ${CMAKE_SOURCE_DIR}/bin for
+#     basalt, basalt-bench and basalt-probe, so binaries land in the SOURCE tree's
+#     bin/, not build/bin/. basalt-vision comes from add_subdirectory(tools/vision).
+#   - serve/engine/modelfile.py looks for basalt-vision as a sibling of the engine
+#     binary, so all four have to share one directory.
+#
 # There is no GPU on a build runner, so nothing here executes the engine. The
-# smoke checks below verify the two things this file can actually get wrong: the
-# runtime image resolving every shared library the engine links, and the Python
-# server importing from the copied tree.
+# checks below verify what this file can actually get wrong: every shipped binary
+# existing, the runtime image resolving every library the engine links, and the
+# Python server importing from the copied tree.
 
 ARG CUDA_DEVEL=nvidia/cuda:13.2.1-devel-ubuntu24.04
 ARG CUDA_RUNTIME=nvidia/cuda:13.2.1-runtime-ubuntu24.04
@@ -38,6 +45,18 @@ RUN cmake -S . -B build -G Ninja \
       -DCMAKE_CUDA_ARCHITECTURES=120 \
     && cmake --build build -j"$(nproc)"
 
+# Collect the shipped binaries. Located by name rather than by a hardcoded build
+# path so a change to RUNTIME_OUTPUT_DIRECTORY upstream fails this step loudly
+# instead of quietly producing an image missing its encoder.
+RUN set -eux; \
+    mkdir -p /artifacts/bin; \
+    for b in basalt basalt-bench basalt-probe basalt-vision; do \
+      src="$(find /src -type f -name "$b" -perm -u+x -printf '%s\t%p\n' | sort -rn | head -1 | cut -f2-)"; \
+      test -n "$src" || { echo "MISSING: $b was not produced by the build"; exit 1; }; \
+      cp -a "$src" /artifacts/bin/; \
+    done; \
+    ls -l /artifacts/bin
+
 # ------------------------------------------------------------- runtime stage
 FROM ${CUDA_RUNTIME} AS runtime
 
@@ -60,7 +79,7 @@ RUN python3 -m venv /opt/basalt/.venv \
 
 # serve/ adds its own parent and a sibling tools/ dir to sys.path, so the
 # repo-root layout has to be preserved.
-COPY --from=build /src/build/bin/ ./bin/
+COPY --from=build /artifacts/bin/ ./bin/
 COPY --from=build /src/serve ./serve/
 COPY --from=build /src/tools ./tools/
 COPY --from=build /src/data ./data/
@@ -68,13 +87,16 @@ COPY --from=build /src/data ./data/
 ENV PYTHONPATH=/opt/basalt
 
 RUN set -eux; \
-    unresolved="$(ldd bin/basalt | awk '/not found/ {print}')"; \
-    test -z "$unresolved" || { echo "engine has unresolved libraries in the runtime image:"; echo "$unresolved"; exit 1; }; \
     test -x bin/basalt; \
+    test -x bin/basalt-vision; \
+    unresolved="$(ldd bin/basalt bin/basalt-vision | awk '/not found/ {print}')"; \
+    test -z "$unresolved" || { echo "unresolved libraries in the runtime image:"; echo "$unresolved"; exit 1; }; \
     .venv/bin/python -c "import serve.server, serve.frontend; print('server imports ok')"
 
-# The model pack and basalt_config.json are NOT baked in. Mount them:
-#   -v /path/to/models:/models:ro  -v /path/to/config:/work
+# The model pack and basalt_config.json are NOT baked in. Mount them, and keep
+# whatever path the config's "model" key names reachable inside this container.
+#   -v /path/to/basalt_config.json:/work/basalt_config.json:ro \
+#   -v /path/to/models:/work/models:ro
 EXPOSE 8080
 
 ENTRYPOINT ["/opt/basalt/bin/basalt"]
