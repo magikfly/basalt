@@ -1,30 +1,52 @@
 name: basalt-image
 
-# Press the button. It merges jesdga95/basalt main into the build tree, compiles
-# for sm_120, and publishes ghcr.io/magikfly/basalt:latest. Nothing else.
+# Daily: take jesdga95/basalt main, compile it for sm_120, publish it as
+# ghcr.io/magikfly/basalt:latest. This workflow stops at the registry - it never
+# touches a running container. Applying :latest is the host's own job (Unraid
+# User Script "basalt image refresh", 04:30 Europe/Amsterdam: pull, compare the
+# index digest, unload the llama-swap model, warm it, fail closed).
 #
-# There is deliberately no gate and no skip. A press always builds. The old
-# version skipped when it could prove an image for the upstream commit already
-# existed - which also meant a Dockerfile fix shipped nothing at all, the exact
-# silent-no-deploy failure mode already hit once on the mnemory workflow.
+#   00:30 UTC  sync-upstream.yml   upstream main -> fork main
+#   01:15 UTC  this workflow       merge upstream -> build -> publish :latest
+#   03:30 UTC  host refresh        :latest -> the running container
 #
-# The merge is never pushed back to GitHub. That is the whole reason this job can
-# run with contents:read. Upstream edits .github/workflows/ci.yml, and GitHub
-# refuses any push from an Actions token that writes a workflow file unless the
-# `workflows` scope is granted; granting it would let an unreviewed upstream
-# commit install a workflow that holds packages:write on this registry.
+# A press of the button always builds: `force` defaults to true on dispatch. Only
+# the schedule may skip, and it skips only when BOTH the upstream commit and a
+# hash of this repo's build inputs already match what :latest carries. Hashing
+# the build inputs is the whole point of the gate - the earlier
+# skip-on-existing-tag version compared the commit alone, so a Dockerfile fix
+# shipped nothing at all, the silent-no-deploy failure mode already hit once on
+# the mnemory workflow. Skipping matters on a schedule for a second reason: if
+# :latest moved every night regardless of content, the 04:30 refresh would
+# cold-start a 122 GiB pack daily for nothing.
 #
-# Nothing is lost by not pushing. This fork owns exactly three files -
-# Dockerfile, .dockerignore, .github/workflows/basalt-image.yml - and upstream
-# ships none of them, so a published image is fully described by its
-# `upstream-<sha>` tag plus those three files, both of which are durable.
+# The merge is never pushed back to GitHub from here. That is the whole reason
+# this job can run with contents:read. Upstream edits .github/workflows/ci.yml,
+# and GitHub refuses any push from an Actions token that writes a workflow file
+# unless the `workflows` scope is granted; granting it would let an unreviewed
+# upstream commit install a workflow that holds packages:write on this registry.
+# Keeping fork main current is sync-upstream.yml's job, and it pins .github/ to
+# this fork's own copies for exactly that reason.
 #
-# Moving :latest does not touch the running box. Watchtower runs with
-# WATCHTOWER_DISABLE_CONTAINERS=strata,basalt. Pulling and recreating basalt is a
-# separate, deliberate act.
+# Nothing is lost for provenance by not pushing from here: this fork owns
+# Dockerfile, .dockerignore and the two workflows, and upstream ships none of
+# them, so a published image is fully described by its upstream-<sha> tag plus
+# those files. The upstream commit also travels inside the image twice: as the
+# ai.basalt.upstream-commit label, and as the engine's own version string, which
+# the web UI shows under Hardware > Engine > Build.
 
 on:
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "Build even if :latest already matches this upstream commit and tree"
+        type: boolean
+        default: true
+  schedule:
+    # 01:15 UTC. A build takes 18-30 min; the host applies :latest at 04:30
+    # Europe/Amsterdam (03:30 UTC in winter), so even a queued runner leaves
+    # slack. Past ~03:00 UTC the update misses the refresh window and waits a day.
+    - cron: "15 1 * * *"
 
 permissions:
   contents: read     # the tree is read and merged locally, never written back
@@ -54,6 +76,7 @@ jobs:
       - name: Merge upstream main into the build tree
         id: upstream
         run: |
+          set -euo pipefail
           git config user.name  "basalt-image[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
@@ -68,11 +91,21 @@ jobs:
 
           if ! git merge --no-edit --no-ff "$SHA" \
                -m "Merge upstream $UPSTREAM_REPO main ($SHA)"; then
-            echo "::error::Merge conflict with upstream; nothing was built or published. Fork-owned paths are Dockerfile, .dockerignore and .github/workflows/basalt-image.yml - if upstream has added one of those, reconcile it by hand."
+            echo "::error::Merge conflict with upstream; nothing was built or published. Fork-owned paths are Dockerfile, .dockerignore and .github/workflows/ - if upstream has added one of those, reconcile it by hand."
             git diff --name-only --diff-filter=U
             exit 1
           fi
-          echo "merged_tree=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+          # Everything that changes an image's bytes besides the upstream source:
+          # the container recipe, what the build context excludes, the target
+          # architecture, and this workflow's own publish step. If one of these
+          # moves, a rebuild is owed even with upstream unchanged.
+          TREE_HASH="$( { echo "arch=${CUDA_ARCH}"; \
+                         cat Dockerfile .dockerignore .github/workflows/basalt-image.yml; } \
+                       | sha256sum | cut -c1-12)"
+          echo "tree_hash=$TREE_HASH" >> "$GITHUB_OUTPUT"
+          echo "built=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
+          echo "merged upstream ${SHA:0:12}; build inputs $TREE_HASH"
 
       - uses: docker/setup-buildx-action@v4
 
@@ -83,7 +116,46 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Is :latest already this tree?
+        id: gate
+        env:
+          WANT_COMMIT: ${{ steps.upstream.outputs.sha }}
+          WANT_TREE: ${{ steps.upstream.outputs.tree_hash }}
+          FORCE: ${{ inputs.force }}
+        run: |
+          set -uo pipefail
+          if [ "$FORCE" = "true" ]; then
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+            echo "forced press - building whatever :latest holds"
+            exit 0
+          fi
+          # buildx imagetools, not curl: a raw basic-auth call with this job's
+          # token 401s against GHCR (measured on run 39850292553) while docker
+          # login with the same token succeeds, and a gate that reads a 401 as
+          # "tag absent" would rebuild on every single schedule. Unreadable
+          # labels mean "build", never "skip" - fail toward shipping, not toward
+          # silence.
+          docker buildx imagetools inspect "${IMAGE}:latest" \
+            --format '{{json .Image.Config.Labels}}' > /tmp/labels.json 2>/dev/null || true
+          cur_commit="$(sed -n 's/.\"ai\.basalt\.upstream-commit"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' /tmp/labels.json | head -1)"
+          cur_tree="$(sed -n 's/.\"ai\.basalt\.tree-hash"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' /tmp/labels.json | head -1)"
+          {
+            echo "latest_commit=$cur_commit"
+            echo "latest_tree=$cur_tree"
+            if [ -n "$cur_commit" ] && [ "$cur_commit" = "$WANT_COMMIT" ] && [ "$cur_tree" = "$WANT_TREE" ]; then
+              echo "skip=true"
+            else
+              echo "skip=false"
+            fi
+          } >> "$GITHUB_OUTPUT"
+          if [ "$cur_commit" = "$WANT_COMMIT" ] && [ "$cur_tree" = "$WANT_TREE" ] && [ -n "$cur_commit" ]; then
+            echo ":latest already carries ${cur_commit:0:12} with build inputs $cur_tree - nothing to build"
+          else
+            echo "building: :latest = ${cur_commit:-<unknown>}/${cur_tree:-<unknown>}, this tree = ${WANT_COMMIT:0:12}/$WANT_TREE"
+          fi
+
       - name: Build and publish
+        if: steps.gate.outputs.skip != 'true'
         uses: docker/build-push-action@v7
         with:
           context: .
@@ -92,11 +164,19 @@ jobs:
             ${{ env.IMAGE }}:latest
             ${{ env.IMAGE }}:upstream-${{ steps.upstream.outputs.short }}
             ${{ env.IMAGE }}:upstream-${{ steps.upstream.outputs.sha }}
+          build-args: |
+            BASALT_BUILD_ID=0.0.1+${{ steps.upstream.outputs.short }}
+            UPSTREAM_SHA=${{ steps.upstream.outputs.sha }}
+            CI_RUN=${{ github.run_id }}
+            CI_BUILDTIME=${{ steps.upstream.outputs.built }}
           labels: |
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
             org.opencontainers.image.base.name=nvidia/cuda:13.2.1-runtime-ubuntu24.04
             ai.basalt.upstream-commit=${{ steps.upstream.outputs.sha }}
             ai.basalt.cuda-arch=${{ env.CUDA_ARCH }}
+            ai.basalt.tree-hash=${{ steps.upstream.outputs.tree_hash }}
+            ai.basalt.ci-run=${{ github.run_id }}
+            ai.basalt.version=0.0.1+${{ steps.upstream.outputs.short }}
           cache-from: type=gha,scope=basalt-image
           cache-to: type=gha,scope=basalt-image,mode=max
 
@@ -107,11 +187,19 @@ jobs:
             echo "## basalt image"
             echo ""
             echo "- upstream commit: \`${{ steps.upstream.outputs.short }}\` (${{ steps.upstream.outputs.ahead }} new to this fork)"
-            if [ "${{ job.status }}" = "success" ]; then
-              echo "- \`${IMAGE}:latest\` = \`upstream-${{ steps.upstream.outputs.short }}\`"
-              echo "- rebuild recipe: upstream@\`${{ steps.upstream.outputs.sha }}\` + this fork's Dockerfile and .dockerignore"
-              echo "- \`main\` is unchanged by design; the merge existed only in this runner."
-            else
-              echo "- **not published** - the tree is left untouched."
-            fi
+            echo "- build inputs: \`${{ steps.upstream.outputs.tree_hash }}\`"
+            case "${{ steps.gate.outputs.skip }}:${{ job.status }}" in
+              true:*)
+                echo "- **skipped** - \`${IMAGE}:latest\` already carries this commit and these build inputs."
+                ;;
+              *:success)
+                echo "- \`${IMAGE}:latest\` = \`upstream-${{ steps.upstream.outputs.short }}\`"
+                echo "- engine version, shown at Hardware > Engine > Build: \`0.0.1+${{ steps.upstream.outputs.short }}\`"
+                echo "- rebuild recipe: upstream@\`${{ steps.upstream.outputs.sha }}\` + this fork's Dockerfile and .dockerignore"
+                echo "- not applied here: the host picks :latest up on its own 04:30 refresh."
+                ;;
+              *)
+                echo "- **not published** - :latest is left where it was."
+                ;;
+            esac
           } >> "$GITHUB_STEP_SUMMARY"

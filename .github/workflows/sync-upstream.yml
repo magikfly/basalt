@@ -1,0 +1,161 @@
+name: sync-upstream
+
+# Keeps fork main equal to jesdga95/basalt main plus this fork's own files: one
+# merge commit a day, ahead of the image build.
+#
+#   00:30 UTC  this workflow       upstream main -> fork main
+#   01:15 UTC  basalt-image.yml    merge -> build -> publish :latest
+#   03:30 UTC  host refresh        :latest -> the running container
+#
+# Why sync main at all, when the image build merges upstream into its own runner
+# tree and never needs main:
+#   - the fork's Code tab becomes the source the shipped image was built from, so
+#     a line in a bug report exists on GitHub;
+#   - the immutable upstream-<sha> image tags then name commits reachable from
+#     this fork's main, not just from upstream;
+#   - a merge conflict surfaces in a workflow whose only job is merging, with the
+#     conflicted paths in its log, instead of halfway through an image build.
+#
+# A stalled sync costs provenance, not updates: basalt-image.yml merges upstream
+# independently, so the box keeps receiving images while main sits.
+#
+# The push never carries upstream's workflow files - .github/ is pinned to this
+# fork's own copies, file for file. Two load-bearing reasons:
+#   - the resulting commit touches nothing under .github/workflows/, so it needs
+#     no `workflows` scope and this job runs on contents:write alone. An Actions
+#     token pushing a workflow file is refused by GitHub without that scope, so
+#     pinning is not cosmetic: without it this push simply fails, which is the
+#     401 that killed run 40124500923;
+#   - no upstream-authored workflow can ever run in this repo holding a token
+#     with packages:write on ghcr.io/magikfly/basalt. Upstream's ci.yml and
+#     pages.yml stay in the tree (deleting them would turn every future upstream
+#     edit of them into a delete/modify conflict in the image build's merge) but
+#     both are disabled in this repo's Actions settings, so they are inert and
+#     cost no runner minutes. Re-enabling either is a deliberate act:
+#       gh workflow enable ci -R magikfly/basalt
+#     The summary below lists what upstream changed under .github/ and was
+#     pinned away, so that deliberateness stays possible.
+
+on:
+  workflow_dispatch: {}
+  schedule:
+    - cron: "30 0 * * *"   # 00:30 UTC, 45 min before the image build
+
+permissions:
+  contents: write    # sole automated writer of fork main
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_REPO: jesdga95/basalt
+  # Paths this fork owns and keeps, whatever upstream does to same-named files.
+  FORK_PATHS: .github Dockerfile .dockerignore
+
+jobs:
+  sync:
+    name: Merge upstream main into fork main
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false   # the push below supplies its own credential
+
+      - name: Merge upstream, fork paths pinned
+        id: merge
+        run: |
+          set -euo pipefail
+          git config user.name  "basalt-sync[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          OURS="$(git rev-parse HEAD)"
+          echo "before=$OURS" >> "$GITHUB_OUTPUT"
+
+          git remote add upstream "https://github.com/${UPSTREAM_REPO}.git"
+          git fetch --no-tags upstream main
+          SHA="$(git rev-parse FETCH_HEAD)"
+          echo "sha=$SHA"              >> "$GITHUB_OUTPUT"
+          echo "short=${SHA:0:12}"     >> "$GITHUB_OUTPUT"
+          echo "behind=$(git rev-list --count HEAD..$SHA)" >> "$GITHUB_OUTPUT"
+
+          if git merge-base --is-ancestor "$SHA" HEAD; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "main already carries upstream ${SHA:0:12}; nothing to merge"
+            exit 0
+          fi
+
+          if ! git merge --no-edit --no-ff "$SHA" \
+               -m "Merge upstream ${UPSTREAM_REPO} main ($SHA)"; then
+            echo "::error::Merge conflict with upstream. main is unchanged, nothing was pushed, and no image is blocked - basalt-image.yml merges upstream on its own."
+            git diff --name-only --diff-filter=U || true
+            git merge --abort || true
+            exit 1
+          fi
+
+          # Fork paths win outright. rm first, then restore from the pre-merge
+          # commit: `git checkout <c> -- <dir>` only writes paths that exist in
+          # <c>, so a workflow file upstream ADDED would otherwise survive here
+          # and get pushed.
+          for p in ${FORK_PATHS}; do
+            rm -rf "$p"
+            git checkout "$OURS" -- "$p"
+          done
+          git commit --amend --no-edit --no-verify
+
+          # The safety argument rests on this assertion. If it trips, the pin
+          # failed and pushing would require the workflows scope - the scope this
+          # job must never be given.
+          if touched="$(git diff --name-only "$OURS" HEAD | grep '^\.github/workflows/' || true)"; [ -n "$touched" ]; then
+            echo "::error::.github pin failed; the merge still carries workflow files. Refusing to push."
+            echo "$touched"
+            exit 1
+          fi
+
+          # What upstream did to the workflows this fork keeps out, for review.
+          git diff --stat "$OURS" HEAD -- .github > /tmp/pinned.txt 2>/dev/null || true
+
+          if [ "$(git rev-parse HEAD)" = "$OURS" ]; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "merge changed nothing after pinning; main stays put"
+            exit 0
+          fi
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+          echo "merged ${SHA:0:12}: $(git diff --shortstat "$OURS" HEAD || echo no file changes)"
+
+      - name: Push main
+        if: steps.merge.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          # a credential helper, so the token appears in neither a URL nor a log
+          gh auth setup-git
+          git push "https://github.com/${{ github.repository }}.git" \
+            "HEAD:refs/heads/${{ github.head_ref || github.ref_name }}"
+
+      - name: Report
+        if: always()
+        run: |
+          {
+            echo "## basalt fork sync"
+            echo ""
+            echo "- upstream: \`${{ steps.merge.outputs.short }}\` (${{ steps.merge.outputs.behind }} commits behind before the merge)"
+            case "${{ steps.merge.outputs.changed }}:${{ job.status }}" in
+              true:success) echo "- fork main fast-merged to upstream \`${{ steps.merge.outputs.short }}\`; \`.github/\`, \`Dockerfile\` and \`.dockerignore\` kept as this fork's." ;;
+              false:success) echo "- **no push** - main already matched, or the merge cancelled out." ;;
+              *) echo "- **not pushed** - main is unchanged. The image build does not depend on this." ;;
+            esac
+            if [ -s /tmp/pinned.txt ]; then
+              echo ""
+              echo "<details><summary>upstream changes under \`.github/\` that this fork pinned away</summary>"
+              echo ""
+              echo '```'
+              cat /tmp/pinned.txt
+              echo '```'
+              echo ""
+              echo "</details>"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"

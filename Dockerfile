@@ -42,6 +42,36 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 WORKDIR /opt/basalt
 COPY . .
 
+# --------------------------------------------------------------- build stamp
+# BASALT_VERSION comes from CMakeLists.txt's project() version. The engine prints
+# it in its INFO line and serve/engine/process.py hands that to the web UI as
+# Hardware > Engine > Build. Upstream keeps it at 0.0.1, so every night's image
+# claims to be the same build; CI passes the upstream commit this tree was merged
+# from and it is compiled in as 0.0.1+8d73a394 - the same 12 hex characters as the
+# immutable upstream-<sha12> tag, so the number on screen names the code running.
+#
+# Rewritten in the build context only; nothing here is pushed to GitHub. If
+# upstream reformats that line the stamp is dropped with a warning rather than
+# failing the image build - a display string must not block the engine update
+# riding with it. The strings check further down covers the other direction: a
+# stamp that was asked for and did not reach the binary fails the build.
+ARG BASALT_BUILD_ID=""
+RUN set -eu; \
+    if [ -z "${BASALT_BUILD_ID}" ]; then \
+      echo "no BASALT_BUILD_ID - version left as upstream defines it"; \
+      : > /tmp/build_id; \
+    elif cp CMakeLists.txt /tmp/CMakeLists.orig && \
+      sed 's/BASALT_VERSION="${PROJECT_VERSION}"/BASALT_VERSION="'"${BASALT_BUILD_ID}"'"/' \
+        /tmp/CMakeLists.orig > CMakeLists.txt && \
+      ! cmp -s /tmp/CMakeLists.orig CMakeLists.txt; then \
+      echo "stamped BASALT_VERSION=${BASALT_BUILD_ID}"; \
+      printf '%s' "${BASALT_BUILD_ID}" > /tmp/build_id; \
+    else \
+      cp /tmp/CMakeLists.orig CMakeLists.txt; \
+      echo "WARNING: BASALT_VERSION line not in the expected shape; using the upstream version"; \
+      : > /tmp/build_id; \
+    fi
+
 # arch 120 (Blackwell) is the only architecture Basalt builds for; CMakeLists.txt
 # hard-fails on anything else. Compiling needs no GPU.
 RUN cmake -S . -B build -G Ninja \
@@ -61,6 +91,18 @@ RUN set -eux; \
       cp -a "$src" /artifacts/bin/; \
     done; \
     ls -l /artifacts/bin
+
+# Proof the stamp survived compilation. Without it the Build field would report
+# a commit that the binary is not built from, which is worse than 0.0.1.
+RUN set -eu; \
+    id="$(cat /tmp/build_id)"; \
+    if [ -z "$id" ]; then echo "no build id to verify"; exit 0; fi; \
+    if ! command -v strings >/dev/null 2>&1; then \
+      echo "WARNING: no strings(1) on the builder; the build id is unverified"; exit 0; \
+    fi; \
+    strings /artifacts/bin/basalt | grep -qF "$id" \
+      || { echo "BUILD ID $id did not reach the engine binary"; exit 1; }; \
+    echo "verified: bin/basalt reports version $id"
 
 # ------------------------------------------------------------- runtime stage
 FROM ${CUDA_RUNTIME} AS runtime
@@ -97,6 +139,21 @@ RUN set -eux; \
     unresolved="$(ldd bin/basalt bin/basalt-vision | awk '/not found/ {print}')"; \
     test -z "$unresolved" || { echo "unresolved libraries in the runtime image:"; echo "$unresolved"; exit 1; }; \
     .venv/bin/python -c "import serve.server, serve.frontend; print('server imports ok')"
+
+# Provenance record beside the engine binary. serve/engine/process.py reads
+# bin/BUILD.json for the version at startup - the engine's own INFO line wins, so
+# this file is the fallback and the machine-readable copy. It answers "which
+# commit is this box running" with a docker exec, no registry query:
+#   docker exec basalt cat /opt/basalt/bin/BUILD.json
+ARG BASALT_BUILD_ID=""
+ARG UPSTREAM_SHA=""
+ARG CI_RUN=""
+ARG CI_BUILDTIME=""
+RUN set -eu; \
+    if [ -z "${UPSTREAM_SHA}" ]; then echo "no build metadata passed - skipping bin/BUILD.json"; exit 0; fi; \
+    printf '{\n  "version": "%s",\n  "upstream_repo": "jesdga95/basalt",\n  "upstream_commit": "%s",\n  "ci_run": "%s",\n  "built": "%s",\n  "cuda_arch": "120"\n}\n' \
+      "${BASALT_BUILD_ID}" "${UPSTREAM_SHA}" "${CI_RUN}" "${CI_BUILDTIME}" > bin/BUILD.json; \
+    cat bin/BUILD.json
 
 # The model pack and basalt_config.json are NOT baked in. Mount them, and keep
 # whatever path the config's "model" key names reachable inside this container.
