@@ -14,7 +14,6 @@ import queue
 from pathlib import Path
 
 from serve.engine import lifeline
-from serve.engine.flags import flag_value
 from serve.engine.process import frame_pipes
 
 # Reads of the encoder's pipe have a timeout: a read that never returns would hold the request turn for good.
@@ -290,25 +289,56 @@ class EngineVision(Vision):
             return [self.cache[k] for k in keys]
 
 
-def gpu_list(cfg: dict) -> list[int]:
-    """The nvidia-smi numbers of the cards --gpu lists (first: model, second: peer tier); [] when none."""
-    g = cfg.get("gpu")
-    if g is None or g == "":
+def gpu_text(value) -> str:
+    """The gpu setting as the engine reads it: "" (unset), "auto" or "A,B,..."; a config may give a number or a list."""
+    if value is None:
+        return ""
+    if isinstance(value, (list, tuple)):
+        return ",".join(str(x).strip() for x in value)
+    return str(value).strip()
+
+
+def check_gpu(value) -> None:
+    """ValueError unless the gpu setting reads as auto or distinct GPU numbers."""
+    text = gpu_text(value)
+    if text in ("", "auto"):
+        return
+    items = [x.strip() for x in text.split(",")]
+    if not all(x.isdigit() for x in items) or len(set(int(x) for x in items)) != len(items):
+        raise ValueError(text)
+
+
+def gpu_plan(engine_bin: str, value) -> dict:
+    """The engine's choice for the gpu setting (`basalt --gpu-plan`): the cards, main first, as "devices" (their
+    CUDA_VISIBLE_DEVICES spelling) and "cards", plus the lines to print once. ValueError with the engine's reason."""
+    import json
+    text = gpu_text(value)
+    cmd = [engine_bin, "--gpu-plan"] + (["--gpu", text] if text else [])
+    try:
+        out = subprocess.run(cmd, capture_output=True, text=True, timeout=60).stdout
+        plan = json.loads(out.strip().splitlines()[-1])
+    except (OSError, subprocess.SubprocessError, ValueError, IndexError):
+        raise ValueError(f"{engine_bin} could not report its GPU choice (--gpu-plan)") from None
+    if plan.get("error"):
+        raise ValueError(plan["error"])
+    return plan
+
+
+def gpu_list(cfg: dict) -> list:
+    """The cards the engine runs on, main first, as CUDA_VISIBLE_DEVICES names them (nvidia-smi numbers, or a UUID
+    where the environment gave one); [] when none was chosen (the mock engine)."""
+    g = gpu_text(cfg.get("gpu"))
+    if g in ("", "auto"):
         return []
-    items = g if isinstance(g, (list, tuple)) else str(g).split(",")
-    return [int(str(x).strip()) for x in items if str(x).strip() != ""]
+    return [int(x) if x.isdigit() else x for x in (w.strip() for w in g.split(",")) if x]
 
 
-def gpus_in_play(cfg: dict, args: list[str]) -> list[int]:
-    """The nvidia-smi numbers of the GPUs the engine uses, its own card first, then the --peer-device card; [0] if none."""
-    visible = gpu_list(cfg)
-    out = visible[:1] or [0]
-    peer = next((a.split("=", 1)[1] for a in reversed(args) if a.startswith("--peer-device=")),
-                flag_value(args, "--peer-device"))
-    if peer is not None and str(peer).strip().lstrip("-").isdigit() and int(peer) >= 0:
-        ordinal = int(peer)
-        out = out + [visible[ordinal] if ordinal < len(visible) else ordinal]
-    return list(dict.fromkeys(out))
+def gpus_in_play(cfg: dict, args: list[str] | None = None) -> list[int]:
+    """The nvidia-smi numbers of the GPUs the engine uses, its main card first; [0] if none."""
+    smi = [i for i in cfg.get("gpu_smi") or [] if isinstance(i, int) and i >= 0]
+    if smi:
+        return smi
+    return [i for i in gpu_list(cfg) if isinstance(i, int)] or [0]
 
 
 def engine_args(cfg: dict) -> list[str]:
@@ -325,48 +355,35 @@ def child_env(cfg: dict) -> dict:
     return env
 
 
-VISION_MODES = ("on", "off", "peer", "dynamic", "cpu")
-VISION_USAGE = "vision: use one of " + ", ".join(VISION_MODES)
+VISION_MODES = ("off", "dynamic", "cpu")
+VISION_USAGE = "vision: use one of " + ", ".join(VISION_MODES) + " or a GPU number, as nvidia-smi numbers them"
 
 
 def vision_mode(value) -> str:
-    """The --vision setting as one of VISION_MODES (None: "off"); booleans and anything else are a ValueError."""
+    """The --vision setting: one of VISION_MODES (None: "off") or a GPU number as a string (the sidecar's own
+    card); booleans and anything else are a ValueError."""
     if value is None:
         return "off"
     text = str(value).strip().lower()
-    if isinstance(value, bool) or text not in VISION_MODES:
-        raise ValueError(f"{VISION_USAGE} (got {value!r})")
-    return text
+    if text in VISION_MODES:
+        return text
+    if text.isascii() and text.isdigit():                 # odd Unicode digits are the error, not int()'s guess
+        return str(int(text))
+    raise ValueError(f"{VISION_USAGE} (got {value!r})")
 
 
-def peer_card(cfg: dict) -> int | None:
-    """The card the peer tier runs on (the second of --gpu); None without a second card."""
-    gpus = gpu_list(cfg)
-    if len(gpus) >= 2:
-        return gpus[1]
-    if not gpus:
-        from serve.engine.modelfile import gpu_count
-        if gpu_count() > 1:
-            return 1
-    return None
+def vision_card(mode) -> int | None:
+    """The GPU number a vision mode names (the sidecar's own card); None for off, dynamic and cpu."""
+    text = str(mode).strip()
+    return int(text) if text.isascii() and text.isdigit() else None
 
 
-def vision_env(cfg: dict, env: dict, mode: str = "peer") -> dict:
-    """The encoder process's environment: `peer` puts it on the second card alone (the engine's when there is none),
-    `on` on the model's own card alone."""
-    gpus = gpu_list(cfg)
-    if mode == "on":
-        if len(gpus) < 2:
-            return env
-        card = gpus[0]
-    else:
-        if len(gpus) < 2:
-            if gpus or peer_card(cfg) is None:
-                return env
-            env = dict(env)
-            env["CUDA_VISIBLE_DEVICES"] = "1"
-            return env
-        card = gpus[1]
+def vision_env(env: dict, mode) -> dict:
+    """The encoder process's environment: a GPU-numbered vision mode runs the sidecar on that card alone; the
+    other modes inherit the engine's environment."""
+    card = vision_card(mode)
+    if card is None:
+        return env
     env = dict(env)
     env["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
     env["CUDA_VISIBLE_DEVICES"] = str(card)
@@ -389,18 +406,16 @@ def vision_line(vision: dict | None, cfg: dict, ready_s: float = 0.0, name=gpu_c
     if not vision:
         return "[server] vision mode: off"
     took = f"ready in {ready_s:.1f} s"
-    mode = vision.get("mode") or ("peer" if vision.get("gpu") else "cpu")
+    mode = vision.get("mode") or "cpu"
     listed = gpu_list(cfg)
     main = listed[0] if listed else 0
 
     def card(i):
         n = name(i)
         return f"GPU {i}{f' ({n})' if n else ''}"
-    if mode == "cpu" or not vision.get("gpu"):
-        return f"[server] vision mode: cpu, {max(1, (os.cpu_count() or 2) // 2)} threads, {took}"
+    gpu = vision_card(mode)
+    if gpu is not None:
+        return f"[server] vision mode: {card(gpu)}, {took}"
     if mode == "dynamic":
         return f"[server] vision mode: dynamic, {card(main)}, loads per image"
-    if mode == "on":
-        return f"[server] vision mode: on, {card(main)}, {took}"
-    other = peer_card(cfg)
-    return f"[server] vision mode: peer, {card(other if other is not None else main)}, {took}"
+    return f"[server] vision mode: cpu, {max(1, (os.cpu_count() or 2) // 2)} threads, {took}"

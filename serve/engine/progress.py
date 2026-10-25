@@ -1,9 +1,13 @@
 """Engine start narration from its log: load bars, warnings, errors and start-failure hints."""
 from __future__ import annotations
 
+import os
+import re
 import sys
 import threading
 import time
+
+from serve.util.loglevel import ERR, WARN, engine_line
 
 
 DRAFT_HEAD_FAIL = "the draft head does not fit"
@@ -22,8 +26,9 @@ def start_failure_hint(log: str | None, offset: int) -> str:
         return ""
     if DRAFT_HEAD_FAIL not in text:
         return ""
-    said = [x.strip()[len("basalt mtp: "):] for x in text.splitlines()
-            if x.strip().startswith("basalt mtp: ") and ("draft head over" in x or "hint:" in x)]
+    said = [e.text for x in text.splitlines()
+            if (e := engine_line(x.strip())) is not None and e.tag == "basalt mtp"
+            and ("draft head over" in e.text or "hint:" in e.text)]
     return ". mtp: " + DRAFT_HEAD_FAIL + ". " + (" ".join(said) if said else "Hint: " + DRAFT_HEAD_HINT)
 
 
@@ -42,27 +47,38 @@ def start_last_line(log: str | None, offset: int) -> str:
     lines = text.splitlines()[1 if start > offset else 0:]   # not a line cut in half
     for x in reversed(lines):
         x = x.strip()
-        if x and not x.startswith("basalt warning:"):
-            return x.removeprefix("basalt generate: ").removeprefix("basalt serve: ")
+        e = engine_line(x) if x else None
+        if x and (e is None or e.level != WARN):
+            return x if e is None else e.text
     return ""
 
 
 class LoadBars:
     """One progress bar per `basalt load:` target against its planned size (a byte counter before the plan).
-    `copy` targets are counted apart from the total. finish() collapses the bars into one result line; off a
-    terminal only that line is printed."""
+    `copy` targets are counted apart from the total. finish() collapses the bars into one result line. Off a
+    terminal the rows print as text once per heartbeat, only while their bytes move.
+
+    A row's MB/s comes from the times its byte counts were read: over the latest >= WINDOW s while it moves,
+    over the engine's last phase for it once it is complete, and none while it stands still unfinished."""
 
     WIDTH = 24
+    TABLE = "ngram"                                    # the n-gram table locked into RAM: its own row, outside the total
+    STILL = 1.0                                        # s without new bytes: the stretch of movement ended
+    WINDOW = 1.0                                       # s of the latest bytes a moving row's rate covers
+    MIN_SPAN = 0.5                                     # s: a shorter span gives no rate
 
     def __init__(self, out=None, gpus=None):
         self.out = out or sys.stdout
+        self.lock = threading.RLock()                  # the narrator and a thread printing a server line share the screen
         self.gpus = list(gpus or [])                   # CUDA ordinal -> nvidia-smi number
         self.tty = self.out.isatty()
         self.total = 0                                 # announced total bytes (0: none)
-        self.targets: dict[tuple[str, bool], dict] = {}   # (target, copy) -> {plan, done, last, seen, start}
+        self.targets: dict[tuple[str, bool], dict] = {}   # (target, copy) -> {plan, done, last, seen, start, ...}
+        self._beat_seen: dict[tuple[str, bool], int] = {}  # bytes each row showed at the previous busy heartbeat
         self.started = 0                               # targets begun
         self.t0 = None
         self.drawn = 0                                 # lines of bars on screen
+        self.shown: list[str] = []                     # the rows on screen
         self.kv: list[tuple[str, int, int, str, int]] = []  # (target, bytes, tokens, kind, max bytes): allocated only
 
     def name(self, target: str) -> str:
@@ -73,10 +89,43 @@ class LoadBars:
         return target
 
     def _target(self, target: str, copy: bool) -> dict:
-        return self.targets.setdefault((target, copy), {"plan": 0, "done": 0, "last": 0, "seen": 0, "start": None})
+        # moves: (time, bytes) read while moving, the first one >= WINDOW before the last; phase: the first bytes
+        # of the engine's current phase for the target; moved: when its bytes last changed
+        return self.targets.setdefault((target, copy), {"plan": 0, "done": 0, "last": 0, "seen": 0, "start": None,
+                                                        "moves": [], "phase": None, "moved": None})
+
+    def _sample(self, t: dict, before: int, now: float) -> None:
+        """Record the target's bytes as read at `now`; `before` is what it held until this line."""
+        have = t["done"] + t["last"]
+        if have == before:
+            return
+        moves = t["moves"]
+        if t["phase"] is None:                         # the phase's first bytes: its rate counts from here
+            t["phase"] = (now, have)
+            moves.clear()
+        elif now - t["moved"] > self.STILL:            # moving again after standing still: a fresh window
+            moves.clear()
+        moves.append((now, have))
+        while len(moves) > 2 and moves[1][0] <= now - self.WINDOW:
+            moves.pop(0)
+        t["moved"] = now
+
+    def _rate(self, t: dict, have: int, now: float) -> str:
+        if t["moved"] is None:
+            return ""
+        if t["plan"] > 0 and have >= t["plan"] and t["phase"] is not None:   # complete: its last phase's rate
+            since, base = t["phase"]
+        elif now - t["moved"] <= self.STILL:           # moving: the latest window
+            since, base = t["moves"][0]
+        else:
+            return ""
+        span = t["moved"] - since
+        if span < self.MIN_SPAN or have <= base:
+            return ""
+        return f"  {(have - base) / 1e6 / span:.0f} MB/s"
 
     def done(self) -> int:
-        return sum(t["done"] + t["last"] for (_, c), t in self.targets.items() if not c)
+        return sum(t["done"] + t["last"] for (tg, c), t in self.targets.items() if not c and tg != self.TABLE)
 
     @staticmethod
     def _bar(done: int, total: int, width: int) -> str:
@@ -84,25 +133,66 @@ class LoadBars:
         n = int(f * width)
         return "=" * n + (">" if n < width else "") + " " * (width - n - 1)
 
-    def lines(self) -> list[str]:
+    def _rows(self, bar: int = WIDTH) -> list[tuple[tuple[str, bool], str]]:
+        """(key, row) per started target, oldest start first, with bars `bar` wide."""
         rows = []
         started = [kv for kv in self.targets.items() if kv[1]["start"] is not None]
+        now = time.monotonic()
         for (target, copy), t in sorted(started, key=lambda kv: kv[1]["start"]):
             have = t["done"] + t["last"]
             if t["plan"] <= 0 and not have:
                 continue                               # planned to hold nothing
+            rate = self._rate(t, have, now)
+            if target == self.TABLE:
+                rows.append(((target, copy), "[server] loading the n-gram table into system ram",
+                             have, t["plan"], rate))
+                continue
             verb = "copying experts to" if copy else "loading weights into"
-            rows.append((f"[server] {verb} {self.name(target)}", have, t["plan"]))
-        pad = max((len(r[0]) for r in rows), default=0)
+            rows.append(((target, copy), f"[server] {verb} {self.name(target)}", have, t["plan"], rate))
+        pad = max((len(r[1]) for r in rows), default=0)
         out = []
-        for label, have, plan in rows:
+        for key, label, have, plan, rate in rows:
             if plan <= 0:                              # no plan yet: a count, not a bar
-                out.append(f"{label.ljust(pad)}  {have / 2**30:5.1f} GiB")
+                out.append((key, f"{label.ljust(pad)}  {have / 2**30:5.1f} GiB{rate}"))
             else:
                 plan = max(plan, have)
-                out.append(f"{label.ljust(pad)} [{self._bar(have, plan, self.WIDTH)}] "
-                           f"{have / 2**30:5.1f}/{plan / 2**30:.1f} GiB")
+                out.append((key, f"{label.ljust(pad)} [{self._bar(have, plan, bar)}] "
+                                 f"{have / 2**30:5.1f}/{plan / 2**30:.1f} GiB{rate}"))
         return out
+
+    def lines(self) -> list[str]:
+        return [text for _, text in self._rows()]
+
+    def moved_lines(self) -> list[str]:
+        """Rows for the heartbeat off a terminal: only the targets whose bytes moved since the
+        previous call; the first call shows every row."""
+        with self.lock:
+            rows = self._rows()
+            have = {(tg, c): t["done"] + t["last"] for (tg, c), t in self.targets.items()}
+            previous = self._beat_seen
+            self._beat_seen = have
+            return [text for key, text in rows if previous.get(key) != have[key]]
+
+    def _fitted(self) -> list[str]:
+        """The rows within the terminal width: shorter bars first, then without the rate, then cut. A wrapped row
+        would take two lines and the erase, which counts rows, would leave its first half behind."""
+        rows = self.lines()
+        try:
+            width = os.get_terminal_size(self.out.fileno()).columns - 1
+        except (AttributeError, OSError, ValueError):
+            width = 0
+        if width <= 0 or all(len(r) <= width for r in rows):   # no size known, or it fits
+            return rows
+        bar = max(8, self.WIDTH - (max(map(len, rows)) - width))
+        rows = [text for _, text in self._rows(bar)]
+        return [r if len(r) <= width else re.sub(r"  \d+ MB/s$", "", r)[:width] for r in rows]
+
+    def refresh(self) -> None:
+        """Redraw the bars when time alone changed them (a rate that ended)."""
+        with self.lock:
+            if self.tty and self.drawn and self._fitted() != self.shown:
+                self._erase()
+                self._draw()
 
     def _erase(self):
         if self.drawn:
@@ -111,17 +201,19 @@ class LoadBars:
 
     def _draw(self):
         if self.tty:
-            rows = self.lines()
+            rows = self._fitted()
             for r in rows:
                 self.out.write("\x1b[2K" + r + "\n")
             self.drawn = len(rows)
+            self.shown = rows
         self.out.flush()
 
     def say(self, text: str) -> None:
         """A line printed above the bars."""
-        self._erase()
-        self.out.write(text + "\n")
-        self._draw()
+        with self.lock:
+            self._erase()
+            self.out.write(text + "\n")
+            self._draw()
 
     def set_kv(self, target: str, nbytes: int, tokens: int, kind: str = "", max_bytes: int = 0) -> None:
         self.kv.append((target, nbytes, tokens, kind, max(max_bytes, nbytes)))
@@ -164,44 +256,64 @@ class LoadBars:
     def set_plan(self, target: str, plan: int, copy: bool = False) -> None:
         if self.t0 is None:
             self.t0 = time.time()
-        self._target(target, copy)["plan"] = plan
-        self._erase()
-        self._draw()
+        with self.lock:
+            self._target(target, copy)["plan"] = plan
+            self._erase()
+            self._draw()
 
     def update(self, target: str, done: int, total: int, copy: bool = False) -> None:
         if self.t0 is None:
             self.t0 = time.time()
-        t = self._target(target, copy)
-        if t["start"] is None:
-            t["start"] = self.started
-            self.started += 1
-        done = min(done, total)
-        if t["seen"] != total or done < t["last"]:     # new phase: the last is complete
-            t["done"] += t["last"] if t["seen"] else 0
-            t["last"] = 0
-            t["seen"] = total
-        t["last"] = done
-        self._erase()
-        self._draw()
+        with self.lock:
+            t = self._target(target, copy)
+            before = t["done"] + t["last"]
+            if t["start"] is None:
+                t["start"] = self.started
+                self.started += 1
+            done = min(done, total)
+            if t["seen"] != total or done < t["last"]:     # new phase: the last is complete
+                t["done"] += t["last"] if t["seen"] else 0
+                t["last"] = 0
+                t["seen"] = total
+                t["phase"] = None
+            t["last"] = done
+            if target == self.TABLE:
+                t["plan"] = total
+            self._sample(t, before, time.monotonic())
+            self._erase()
+            self._draw()
 
     def finish(self) -> None:
         """The engine is up: replace the bars with the result line."""
-        self._erase()
-        done = self.done()
-        want = self.total or sum(t["plan"] for (_, c), t in self.targets.items() if not c)
-        if done > 0 and done >= want:                  # a failed start is reported elsewhere
-            def part(copy):
-                return {tg: t["done"] + t["last"] for (tg, c), t in self.targets.items()
-                        if c == copy and t["done"] + t["last"]}
-            parts = ", ".join(f"{self.name(tg)} {b / 2**30:.1f} GiB" for tg, b in part(False).items())
-            extra = "".join(f"; {self.name(tg)} copy {b / 2**30:.1f} GiB" for tg, b in part(True).items())
-            self.out.write(f"[server] loaded {done / 2**30:.1f} GiB in {time.time() - self.t0:.1f} s "
-                           f"({parts}{extra})\n")
-        for line in self.kv_lines():
-            self.out.write(line + "\n")
-        self.kv.clear()
-        self.targets.clear()
-        self.out.flush()
+        with self.lock:
+            self._erase()
+            done = self.done()
+            want = self.total or sum(t["plan"] for (tg, c), t in self.targets.items() if not c and tg != self.TABLE)
+            if done > 0 and done >= want:                  # a failed start is reported elsewhere
+                def part(copy):
+                    return {tg: t["done"] + t["last"] for (tg, c), t in self.targets.items()
+                            if c == copy and tg != self.TABLE and t["done"] + t["last"]}
+                parts = ", ".join(f"{self.name(tg)} {b / 2**30:.1f} GiB" for tg, b in part(False).items())
+                extra = "".join(f"; {self.name(tg)} copy {b / 2**30:.1f} GiB" for tg, b in part(True).items())
+                self.out.write(f"[server] loaded {done / 2**30:.1f} GiB in {time.time() - self.t0:.1f} s "
+                               f"({parts}{extra})\n")
+            for line in self.kv_lines():
+                self.out.write(line + "\n")
+            self.kv.clear()
+            self.targets.clear()
+            self.out.flush()
+
+
+_active: "LoadBars | None" = None                     # the bars on screen during a start
+
+
+def server_line(text: str) -> None:
+    """Print a `[server]` line; while load bars are on screen it goes above them, so they are redrawn in place."""
+    bars = _active
+    if bars is not None:
+        bars.say(text)
+    else:
+        print(text, flush=True)
 
 
 def load_progress(line: str):
@@ -257,29 +369,27 @@ def load_total(line: str):
 
 
 def engine_warning(line: str):
-    """The text of an engine `basalt warning: <text>` line, else None."""
-    if line.startswith("basalt warning: ") and line[16:].strip():
-        return line[16:].strip()
-    return None
+    """The text of an engine warning line, else None."""
+    e = engine_line(line)
+    return e.text.strip() if e is not None and e.level == WARN and e.text.strip() else None
 
 
 def engine_ram_floor(line: str):
     """The text after `RAM floor ` of an engine `basalt generate: RAM floor ...` line, else None."""
-    head = "basalt generate: RAM floor "
-    if line.startswith(head) and line[len(head):].strip():
-        return line[len(head):].strip()
+    e = engine_line(line)
+    if e is not None and e.tag == "basalt generate" and e.text.startswith("RAM floor ") and e.text[10:].strip():
+        return e.text[10:].strip()
     return None
 
 
 def engine_error(line: str):
-    """The text of an engine `basalt error: <text>` line, else None."""
-    if line.startswith("basalt error: ") and line[14:].strip():
-        return line[14:].strip()
-    return None
+    """The text of an engine error line, else None."""
+    e = engine_line(line)
+    return e.text.strip() if e is not None and e.level == ERR and e.text.strip() else None
 
 
 def start_errors(log: str | None, offset: int) -> list[str]:
-    """The engine's `basalt error:` lines this start wrote to its log."""
+    """The engine's error lines this start wrote to its log."""
     if not log:
         return []
     try:
@@ -293,11 +403,13 @@ def start_errors(log: str | None, offset: int) -> list[str]:
 
 def narrate_start(log_path: str, offset: int, done: threading.Event, heartbeat=20.0, out=None, gpus=None) -> None:
     """Show load progress and warnings from the engine log, with a heartbeat while idle."""
-    bars = LoadBars(out, gpus)
+    global _active
+    bars = _active = LoadBars(out, gpus)
     t0 = last = time.time()
+    beat = t0                                # last busy heartbeat
     pos = offset
     while True:
-        stop = done.wait(0.25)
+        stop = done.wait(0.05)               # often: a row's rate is timed by when its lines are read
         try:
             with open(log_path, "rb") as f:
                 f.seek(pos)
@@ -323,9 +435,16 @@ def narrate_start(log_path: str, offset: int, done: threading.Event, heartbeat=2
                     bars.say(f"[server] warning: {w}")
                 elif (r := engine_ram_floor(line)) is not None:
                     bars.say(f"[server] RAM floor: {r}")
+        bars.refresh()
         if stop:
             bars.finish()
+            if _active is bars:
+                _active = None
             return
+        if not bars.tty and time.time() - beat >= heartbeat:     # busy heartbeat: print only rows that moved
+            beat = time.time()
+            for r in bars.moved_lines():
+                bars.say(r)                                        # prints nothing when no bytes moved
         if time.time() - last > heartbeat:
             last = time.time()
             bars.say(f"[server] still starting, {time.time() - t0:.0f} s")

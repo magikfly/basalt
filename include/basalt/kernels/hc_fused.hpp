@@ -7,6 +7,7 @@
 //   lo[k] = silu((w_down[k] . xn) / hc),  inject[c] = w_inject[c] . xn
 //   mixed[d] = mean_c xn[c,d] * sigmoid(w_up[c*n_embd + d] . lo),  R <- R'
 //   logits = w_router . mixed,  (ids, weights) = top-10 of softmax(logits)   (when w_router)
+//   gate_sh = sigmoid(w_gate_sh . mixed)                                       (when w_gate_sh)
 //
 // One CTA per SM; the work is a queue of items in dependency order, handed on through counters in global memory
 // instead of kernel boundaries: 88 down items (the matrices' 8-bit rows over half-streams of the stream rows, each
@@ -47,10 +48,22 @@ struct HcFusedArgs {
     /// mixed's q8_1 rows (36-byte blocks, [T][n_embd / 32]), or null: written by the router items, or without a
     /// router by the up slices
     void* xq = nullptr;
+    /// With a router: the shared expert's gate-input row (bf16 [n_embd], 16-byte aligned), or null.  The router items
+    /// dot it with mixed as a router row (the MMVF's arithmetic) and write sigmoid of the dot per token to gate_sh, as
+    /// shared_expert_multi's gate kernel does.
+    const uint16_t* w_gate_sh = nullptr;
+    float* gate_sh = nullptr;           ///< [T]
+    /// With a router: mixed's q8_1 rows as native_quantize_q8_1 writes them ([T][n_embd / 32]), or null
+    void* xq_sh = nullptr;
     const void* pf[4] = {nullptr, nullptr, nullptr, nullptr};
     size_t pf_bytes[4] = {0, 0, 0, 0};
     /// let the next kernel in at the start (its blocks take the SMs this read's blocks leave)
     bool next_early = false;
+    /// A read with a router and xq may also count its progress for a kernel that starts before it ends (device, three
+    /// words): each router item adds one to pub_ctr[0] once its share of xq is written (hc_fused_pub_arrivals() in
+    /// all), the top-10 adds one to pub_ctr[1] once the ids and weights are, and the last up slice adds one to
+    /// pub_ctr[2] once mixed is complete.  Null: no counts.
+    unsigned* pub_ctr = nullptr;
     /// 8-bit copies of w_down / w_up / w_inject (int8, one f16 scale per 32 consecutive values of a row); null: found
     /// from the copies hc8_prepare / hc8_upload registered for the bf16 matrices (every read needs them).
     const int8_t* q_down = nullptr;
@@ -66,6 +79,8 @@ struct HcFusedArgs {
 bool hc8_enabled();
 /// Whether a read writes HcFusedArgs::xq.
 bool hc_fused_q8_rows_ok();
+/// The arrivals a read adds to HcFusedArgs::pub_ctr[0] (its router items').
+unsigned hc_fused_pub_arrivals();
 /// Quantize the bf16 matrix w [rows][cols] (cols a multiple of 32) to an 8-bit copy on the current device, once per
 /// pointer, outside any stream capture.  A row's scales start every (cols / 32 rounded up to 8) f16; the copy and its
 /// scales are one allocation (one prefetch range).

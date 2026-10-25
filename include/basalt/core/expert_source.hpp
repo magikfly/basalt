@@ -128,6 +128,20 @@ inline uint64_t resident_room(uint64_t physical, uint64_t headroom) {
 /// (the caller copies out's bytes there).  False, and nothing changed, unless `in` is in the copy and `out` is not.
 bool exchange_cache_complement(std::vector<uint64_t>& offsets, size_t in, size_t out);
 
+/// A RAM region holding experts a shrunken VRAM cache gave up.  Its places live in the offset space after the
+/// complement and the top-up region: `[base, base + bytes)`.
+struct HomeRegion {
+    uint64_t base = 0, bytes = 0;
+    void* arena = nullptr;
+    const uint8_t* device = nullptr;   ///< the mapped device alias when page-locked through the driver
+    uint64_t locked = 0;               ///< bytes held in the working set (a malloc'd region)
+    bool pinned = false;
+};
+/// The region holding the `bytes` at `off`, or -1.
+int home_region_find(const std::vector<HomeRegion>& regions, uint64_t off, uint64_t bytes);
+/// Whether any expert's place lies in the region.
+bool home_region_used(const HomeRegion& r, const std::vector<uint64_t>& offsets);
+
 }  // namespace detail
 
 
@@ -173,6 +187,9 @@ public:
 
     /// The DEVICE address of a pinned, mapped blob (the GPU can read it over PCIe), or null.
     virtual const uint8_t* device_alias(int64_t layer, int64_t expert) const { (void) layer; (void) expert; return nullptr; }
+    /// Changes whenever an expert's RAM place (so its `device_alias`) may have changed: a swap's exchange, a spare
+    /// place landing or freed, a RAM home, the top-up.  The places move only between verify windows.
+    virtual uint64_t places_generation() const { return 0; }
     /// A file-backed source: start reading this expert's pages now (it will be needed by the CPU); no-op elsewhere.
     virtual void prefetch(int64_t layer, int64_t expert) { (void) layer; (void) expert; }
     /// A file-backed source: queue the read of these experts' file pages now (a helper thread issues it, the caller
@@ -490,6 +507,25 @@ public:
     /// (0: nothing done); `count` gets the experts.
     uint64_t top_up(const std::vector<std::pair<int32_t, int32_t>>& rank,
                     const std::function<bool(int32_t, int32_t)>& skip, bool pin, int64_t& count, uint64_t later = 0);
+    // ---- RAM homes for the experts a shrinking VRAM cache gives up (--vram-elastic in the resident mode).  The
+    // caller asks for homes (`homes_take`: one region, refused with `err` when the RAM budget cannot hold it), copies
+    // each expert from its slot into `dst[k]`, waits for the copies, and calls `homes_commit`: the experts are then
+    // read from RAM like the compact copy's.  `homes_abort` drops an uncommitted take.  When an expert goes back
+    // into a slot, `home_release` frees its place (false when its copy is not in a home region); `homes_reclaim`
+    // returns the regions no expert uses to the OS.  Only on the main thread between requests, with no swap in flight
+    // and no pool, keep-alive or read-ahead thread reading `blob()`; the place space only grows (a freed region's
+    // places are not reused).
+    bool homes_take(const std::vector<std::pair<int32_t, int32_t>>& experts, std::string& err, std::vector<uint8_t*>& dst);
+    void homes_commit();
+    void homes_abort();
+    bool home_release(int64_t layer, int64_t expert);
+    uint64_t homes_reclaim();
+    /// Moves the experts still in homes into fresh regions and frees the old ones (bytes freed; 0 when it would
+    /// free less than a region or the RAM cannot take the copy).  Only with no exchange in flight.
+    uint64_t homes_compact();
+    uint64_t homes_bytes() const;
+    /// RAM above the margin that a take leaves free (the server's guard floor and the engine's later allocations).
+    void set_homes_reserve(uint64_t bytes) { homes_reserve_ = bytes; }
     /// Debug: whether `bytes` equal the expert's bytes in the model files.
     bool equals_file(int64_t layer, int64_t expert, const uint8_t* bytes) const;
     /// With the compact copy ready: blobs read from the mapped file since (what the plain mmap mode may read from
@@ -511,6 +547,7 @@ public:
     bool pinned(int64_t layer, int64_t expert) const override;
     bool file_extent(int64_t layer, int64_t expert, int& fd, uint64_t& offset) const override;
     const uint8_t* device_alias(int64_t layer, int64_t expert) const override;
+    uint64_t places_generation() const override { return places_gen_; }
     bool pcie_layer(int64_t layer) const override;
     bool copy_blob(int64_t layer, int64_t expert, uint8_t* dst) override;
     /// Each blob read from the file with block-aligned unbuffered reads into small pinned staging buffers; a blob that
@@ -549,6 +586,12 @@ private:
     const uint8_t* top_device_ = nullptr;
     uint64_t top_bytes_ = 0, top_locked_ = 0;
     bool top_pinned_ = false;
+    std::vector<detail::HomeRegion> homes_;
+    uint64_t homes_reserve_ = 0;
+    bool exchange_live() const;   // a staged exchange's buffer is still read in place of a slot
+    uint64_t homes_next_ = 0;   // the next region's base (0: none yet)
+    std::vector<std::pair<size_t, uint64_t>> homes_pending_;   // (expert index, place) of an uncommitted take
+    uint64_t homes_start() const { return complement_bytes_ + top_bytes_; }
     /// The host address of a blob of `bytes` at offset `off` (either region), or nullptr.
     const uint8_t* host_at(uint64_t off, uint64_t bytes) const;
     std::vector<uint64_t> complement_offsets_;
@@ -569,6 +612,7 @@ private:
     int64_t xstage_cap_ = 0;
     uint64_t xstage_blob_ = 0;
     int64_t exchanges_ = 0;
+    uint64_t places_gen_ = 0;   ///< places_generation
     int64_t spares_want_ = 0;
     std::vector<std::pair<uint64_t, uint64_t>> spare_free_;   // (offset, bytes) of free places
     std::atomic<int64_t> file_reads_{0};

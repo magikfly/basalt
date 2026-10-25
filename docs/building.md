@@ -25,6 +25,11 @@ The server tests run with `python -m unittest discover -s serve/tests -t .` afte
 vocabulary and skip without a pack; the same checks run on a synthetic vocabulary in the same file. The test that runs
 the built engine with every flag needs `bin/basalt`.
 
+The engine tokenizes request text itself (`GENT`). `tokenizer_test` checks the C++ tokenizer on a synthetic vocabulary;
+`tokenizer_parity` compares its ids with `tools/tokenizer.py` over a corpus, and is registered when cmake gets
+`-DBASALT_TOKENIZER_DIR=<a pack's extracted tokenizer/ directory>` (with python3 and the `regex` package; `-DBASALT_TOKENIZER_BIG`
+adds `--big FILE...` to the corpus). `tokenizer_bench DIR FILE...` times a cold and a warm encode.
+
 `basalt-bench` reads its pre-tokenized prompts from `data/bench` (token ids for the Qwen3.8-Flash-Next tokenizer: the
 three decode prompts and a prefill filler); run it from the repository root or pass `--fixtures DIR`. `basalt-bench
 --help` says how the files are made.
@@ -37,10 +42,10 @@ with their MIT licence in `THIRD_PARTY_LICENSES`.
 the three decode fixtures, a 16384-token prefill and a 65536-token prefill, each once, with int8 KV cache and the
 engine's own defaults otherwise (drafting included). The decode fixtures and each prefill run in their own fresh engine
 process, with no warm-up pass and no repetition, so every number is the cold first run. It
-prints the usual table, then one JSON row to paste into `docs/community/benchmarks.json`:
+prints the usual table, adds its row to `docs/community/benchmarks.json` of the checkout the build came from (`--community-file PATH` picks another file) and prints it. Review the row, commit it and open a pull request:
 
 ```sh
-bin/basalt-bench --community --model Qwen3.8-FN-NVFP4.basalt --submitter YOUR_GITHUB_HANDLE
+bin/basalt-bench --community --model Qwen3.8-FN-NVFP4.basalt --submitter "Your Name"
 ```
 
 `prefill_16k_tps` and `prefill_64k_tps` are the engine tokens per second of those two prompts; `decode_tps` is the generated tokens of conv, struct and prose over their summed decode time (token-weighted). The row
@@ -48,5 +53,5 @@ records the engine commit, the GPUs the engine used (main first) with VRAM and e
 RAM, the OS (`Linux`, `Windows` or `WSL2`), the pack's quant label. Every expert must sit in VRAM, the peer GPU or RAM: if the engine would read any from the SSD, the bench stops before measuring, says how many GiB would spill and roughly how much more free RAM is needed, exits non-zero and prints no row. NVML is required;
 without it, or without a git build, the run stops with a message. Only `--model`, `--submitter`, `--fixtures` (the
 repository's `data/bench`), `--logs` and `--print-command` are accepted: any other bench option or engine flag changes
-the workload and is refused. A second visible GPU is used as the peer tier, as in the plain bench; hide it with
-`CUDA_VISIBLE_DEVICES=0` for a single-GPU row. The preset's version changes whenever the workload does.
+the workload and is refused. The run uses every visible Blackwell GPU (`--gpu auto`; `--gpu` is refused); pick the cards with
+`CUDA_VISIBLE_DEVICES`, for example `CUDA_VISIBLE_DEVICES=0` for a single-GPU row. The preset's version changes whenever the workload does.

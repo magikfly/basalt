@@ -1,16 +1,24 @@
-// src/kernels/hc_fused_parity.cpp - hc_fused_read against the kernels it replaces (fused_gr_read_multi, then the
-// MMVF router GEMV and the native top-10), bit for bit on every output, with real geometry and random inputs; then
-// the time of both with the weights hot in L2 and cold (L2 overwritten before every read).  DEC_HC8=1: the
-// fused read on 8-bit copies of the matrices (run with --tol).
+// src/kernels/hc_fused_parity.cpp - hc_fused_read against the kernels it replaces (fused_gr_read_multi on the 8-bit
+// copies, then the MMVF router GEMV and the native top-10), with real geometry and random inputs.  The fused read
+// has its own reduction order and fast exponentials, so against those kernels each output must agree within
+// kRelTol of its largest value and pick the same experts; against itself it must be bitwise: repeated launches,
+// every window width, reversed token order and overlapped launches (--stress).  A read that counts its progress
+// against one that does not, its q8_1 rows against a CPU quantizer.  Then the time of both with the weights hot in L2
+// and cold (L2 overwritten before every read).
 //
-//     build/hc_fused_parity [iters] [T min] [T max]
+//     build/hc_fused_parity [iters] [T min] [T max] [--tol] [--check-only] [--stress N]
+//
+// --tol prints every case's differences against the plain kernels, not only the failing ones.
 #include "basalt/core/diag.hpp"
 #include "basalt/kernels/bf16_gemv.hpp"
 #include "basalt/kernels/fused_gr.hpp"
 #include "basalt/kernels/hc_fused.hpp"
+#include "basalt/kernels/native_mmvq.hpp"
 #include "basalt/kernels/native_router.hpp"
 #include "basalt/kernels/pdl.hpp"
+#include "basalt/kernels/shared_expert.hpp"
 
+#include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
 #include <algorithm>
@@ -27,6 +35,9 @@
 
 namespace K = basalt::kernels;
 
+
+// the fused read's largest deviation from the plain kernels, relative to the output's largest value
+constexpr double kRelTol = 2e-6;
 
 static uint16_t bf16(float x) {
     uint32_t u;
@@ -259,7 +270,7 @@ int main(int argc, char** argv) {
                 }
                 cudaStreamSynchronize(s);
                 const std::vector<float> v2 = fetch(1, T);
-                if (tol) {
+                {
                     double mx[8] = {0}, ref[8] = {0}, sum[8] = {0};
                     size_t cnt[8] = {0};
                     for (size_t i = 0; i < v[0].size(); ++i) {
@@ -280,7 +291,15 @@ int main(int argc, char** argv) {
                                 idiff += found ? 0 : 1;
                             }
                     }
-                    std::printf("T %d mode %d apply %d:", T, mode, apply);
+                    bool bad = std::memcmp(v[1].data(), v2.data(), v[1].size() * 4) != 0 || idiff != 0;
+                    for (int pt : {0, 1, 2, 3, 4, 5, 6})
+                        if (cnt[pt] && ref[pt] > 0 && mx[pt] > kRelTol * ref[pt]) bad = true;
+                    if (bad) ++failures;
+                    if (!tol && !bad) {
+                        if (mode == 1 && apply == 1) by_t[T] = v[1];
+                        continue;
+                    }
+                    std::printf("T %d mode %d apply %d%s:", T, mode, apply, bad ? " FAIL" : "");
                     for (int pt : {0, 1, 4, 5, 6})
                         if (cnt[pt]) std::printf(" %s max %.2e (rel %.2e) mean %.2e |", part_name[pt], mx[pt],
                                                  ref[pt] > 0 ? mx[pt] / ref[pt] : 0.0, sum[pt] / cnt[pt]);
@@ -293,28 +312,10 @@ int main(int argc, char** argv) {
                     std::printf(" routed experts differing %d of %d | hash %016llx\n", idiff, router ? T * KT : 0,
                                 (unsigned long long) hsh);
                     if (mode == 1 && apply == 1) by_t[T] = v[1];
-                    continue;
-                }
-                size_t ndiff = 0, first = 0;
-                for (size_t i = 0; i < v[0].size(); ++i) {
-                    if (!inject && part_of(i, T) == 3) continue;
-                    if (!router && part_of(i, T) >= 5) continue;
-                    uint32_t u0, u1, u2;
-                    std::memcpy(&u0, &v[0][i], 4);
-                    std::memcpy(&u1, &v[1][i], 4);
-                    std::memcpy(&u2, &v2[i], 4);
-                    if (u0 != u1 || u1 != u2) {
-                        if (ndiff++ == 0) first = i;
-                    }
-                }
-                if (ndiff) {
-                    ++failures;
-                    std::printf("T %d mode %d apply %d: %zu values differ, first in %s (index %zu): %a vs %a\n", T, mode,
-                                apply, ndiff, part_name[part_of(first, T)], first, v[0][first], v[1][first]);
                 }
             }
         }
-    if (tol && !by_t[t_hi].empty()) {   // token k of a window of T against token k of the widest window
+    if (!by_t[t_hi].empty()) {   // token k of a window of T against token k of the widest window
         int bad = 0;
         const int TH = t_hi;
         const size_t szh[8] = {(size_t) TH * D, (size_t) TH * LR, (size_t) TH * HC, (size_t) TH * HC, (size_t) TH * N,
@@ -362,6 +363,209 @@ int main(int argc, char** argv) {
     }
     std::printf("hc_fused_parity: %d differing cases (T %d..%d, 3 modes, with and without the pending write)\n",
                 failures, t_lo, t_hi);
+
+    // a counting read (the MoE ring's block starts before it ends): the router items' and the top-10's counts land,
+    // and every output - xq included - is the read's without them; xq is also checked against a CPU quantizer
+    {
+        const size_t qb = (size_t) TM * (N / 32) * 36;
+        void* dxq = nullptr;
+        void* dxq0 = nullptr;
+        unsigned* dpc = nullptr;
+        cudaMalloc(&dxq, qb);
+        cudaMalloc(&dxq0, qb);
+        cudaMalloc((void**) &dpc, 12);
+        // hc_q8_1_store on the CPU: the butterfly sum of the 32 values, d = amax / 127, q = round(x / d)
+        auto q8_ref = [&](const float* x, uint8_t* blk) {
+            float v[32], amax = 0.f;
+            for (int i = 0; i < 32; ++i) { v[i] = x[i]; amax = std::max(amax, std::fabs(x[i])); }
+            for (int o = 16; o > 0; o >>= 1) {
+                float t[32];
+                for (int i = 0; i < 32; ++i) t[i] = v[i] + v[i ^ o];
+                std::memcpy(v, t, sizeof v);
+            }
+            auto fin = [](float f) { return std::fabs(f) > 65504.f ? std::copysign(65504.f, f) : f; };
+            const float d = fin(amax / 127.0f);
+            const __half hd = __float2half(fin(d)), hs = __float2half(fin(v[0]));
+            std::memcpy(blk, &hd, 2);
+            std::memcpy(blk + 2, &hs, 2);
+            for (int i = 0; i < 32; ++i) {
+                float q = amax == 0.f ? 0.f : std::round(x[i] / d);
+                q = q > 127.f ? 127.f : q < -127.f ? -127.f : q;
+                blk[4 + i] = (uint8_t) (int8_t) q;
+            }
+        };
+        int pbad = 0;
+        for (int T = t_lo; T <= t_hi; ++T) {
+            std::vector<std::vector<float>> v(2);
+            std::vector<uint8_t> q[2];
+            unsigned cnt[3] = {0, 0, 0};
+            for (int counted = 0; counted < 2; ++counted) {
+                void* const xqd = counted ? dxq : dxq0;
+                cudaMemset(dpc, 0, 12);
+                cudaMemset(xqd, 0xee, qb);
+                reset(1);
+                Out& x = o[1];
+                K::HcFusedArgs a;
+                a.T = T; a.R = x.R; a.R_out = x.R; a.apply = true; a.bo_prev = dbo; a.inj_prev = dinj;
+                a.w_norm = dwn; a.w_down = dwd; a.w_up = dwu; a.w_inject = dwi;
+                a.lo = x.lo; a.rs = x.rs; a.inject_out = x.io; a.mixed = x.mix; a.xn = x.xn;
+                a.w_router = dwr; a.logits = x.logits; a.ids = x.ids; a.weights = x.w; a.xq = xqd;
+                a.pub_ctr = counted ? dpc : nullptr;
+                {
+                    K::PdlScope ps(true);
+                    K::hc_fused_read(a, s);
+                }
+                if (cudaStreamSynchronize(s) != cudaSuccess) {
+                    std::printf("counting read failed: %s\n", cudaGetErrorString(cudaGetLastError()));
+                    return 1;
+                }
+                v[counted] = fetch(1, T);
+                q[counted].resize((size_t) T * (N / 32) * 36);
+                cudaMemcpy(q[counted].data(), xqd, q[counted].size(), cudaMemcpyDeviceToHost);
+                cudaMemcpy(cnt, dpc, 12, cudaMemcpyDeviceToHost);
+            }
+            std::vector<float> mix((size_t) T * N);
+            cudaMemcpy(mix.data(), o[1].mix, mix.size() * 4, cudaMemcpyDeviceToHost);
+            std::vector<uint8_t> qr(q[1].size());
+            for (int b = 0; b < T * N / 32; ++b) q8_ref(mix.data() + (size_t) b * 32, qr.data() + (size_t) b * 36);
+            const bool bad = std::memcmp(v[0].data(), v[1].data(), v[0].size() * 4) != 0 ||
+                             std::memcmp(q[0].data(), q[1].data(), q[0].size()) != 0 ||
+                             std::memcmp(qr.data(), q[1].data(), qr.size()) != 0 ||
+                             cnt[0] != K::hc_fused_pub_arrivals() || cnt[1] != 1u || cnt[2] != 1u ||
+                             (!by_t[T].empty() && std::memcmp(v[1].data(), by_t[T].data(), v[1].size() * 4) != 0);
+            if (bad) std::printf("T %d: a counting read differs (counts %u of %u, %u, %u)\n", T, cnt[0], K::hc_fused_pub_arrivals(), cnt[1],
+                                 cnt[2]);
+            pbad += bad;
+        }
+        std::printf("hc_fused_parity: %d window sizes where a counting read's outputs, xq or counts differ (must be 0)\n",
+                    pbad);
+        failures += pbad ? 1 : 0;
+        cudaFree(dxq);
+        cudaFree(dxq0);
+        cudaFree(dpc);
+    }
+
+    // a read that also gives the shared expert its gate and q8_1 rows: every other output is the plain read's, xq_sh is
+    // native_quantize_q8_1's bytes, and the shared expert's projections from them (shared_expert_multi_rows, gate and
+    // up on two streams) times gate_sh, one IEEE product per value, are shared_expert_multi's output bit for bit
+    // (random Q6_K gate/up and Q8_0 down at the model's shapes, a random bf16 gate-input row)
+    {
+        const int FF = 640;
+        std::mt19937 wr8(23);
+        auto sane_half = [&]() {   // a normal fp16 in +-[2^-10, 2^-5)
+            const uint32_t r = wr8();
+            return (uint16_t) (((r >> 31) << 15) | ((5u + (r >> 10) % 5u) << 10) | (r & 0x3ffu));
+        };
+        auto blocks = [&](size_t n_blocks, int bytes, int scale_at) {
+            std::vector<uint8_t> w(n_blocks * (size_t) bytes);
+            for (auto& b : w) b = (uint8_t) (wr8() & 0xff);
+            for (size_t k = 0; k < n_blocks; ++k) {
+                const uint16_t h = sane_half();
+                std::memcpy(&w[k * (size_t) bytes + (size_t) scale_at], &h, 2);
+            }
+            return w;
+        };
+        const std::vector<uint8_t> wg = blocks((size_t) FF * (N / 256), 210, 208), wu8 = blocks((size_t) FF * (N / 256), 210, 208),
+                                   wdn = blocks((size_t) N * (FF / 32), 34, 0);
+        std::vector<uint16_t> wgi(N);
+        for (auto& x : wgi) x = bf16(0.05f * nd(rng));
+        void *dwg = nullptr, *dwu8 = nullptr, *dwdn = nullptr, *dxq = nullptr, *dxqs = nullptr, *dxqn = nullptr;
+        uint16_t* dwgi = nullptr;
+        float *dgs = nullptr, *dga = nullptr, *dupb = nullptr, *dgl = nullptr, *dold = nullptr, *dnew = nullptr;
+        const size_t qb = K::native_q8_1_bytes(N, TM);
+        cudaMalloc(&dwg, wg.size());
+        cudaMalloc(&dwu8, wu8.size());
+        cudaMalloc(&dwdn, wdn.size());
+        cudaMalloc((void**) &dwgi, (size_t) N * 2);
+        cudaMalloc(&dxq, qb);
+        cudaMalloc(&dxqs, qb);
+        cudaMalloc(&dxqn, qb);
+        cudaMalloc((void**) &dgs, TM * 4);
+        cudaMalloc((void**) &dga, (size_t) TM * FF * 4);
+        cudaMalloc((void**) &dupb, (size_t) TM * FF * 4);
+        cudaMalloc((void**) &dgl, (TM + 4) * 4);
+        cudaMalloc((void**) &dold, (size_t) TM * N * 4);
+        cudaMalloc((void**) &dnew, (size_t) TM * N * 4);
+        cudaMemcpy(dwg, wg.data(), wg.size(), cudaMemcpyHostToDevice);
+        cudaMemcpy(dwu8, wu8.data(), wu8.size(), cudaMemcpyHostToDevice);
+        cudaMemcpy(dwdn, wdn.data(), wdn.size(), cudaMemcpyHostToDevice);
+        cudaMemcpy(dwgi, wgi.data(), (size_t) N * 2, cudaMemcpyHostToDevice);
+        cudaStream_t s2;
+        cudaStreamCreateWithFlags(&s2, cudaStreamNonBlocking);
+        cudaEvent_t evf, evj;
+        cudaEventCreateWithFlags(&evf, cudaEventDisableTiming);
+        cudaEventCreateWithFlags(&evj, cudaEventDisableTiming);
+        int sbad = 0;
+        for (int T = t_lo; T <= t_hi; ++T) {
+            reset(1);
+            cudaMemset(dxqs, 0xee, qb);
+            cudaMemset(dgs, 0xee, TM * 4);
+            Out& x = o[1];
+            K::HcFusedArgs a;
+            a.T = T; a.R = x.R; a.R_out = x.R; a.apply = true; a.bo_prev = dbo; a.inj_prev = dinj;
+            a.w_norm = dwn; a.w_down = dwd; a.w_up = dwu; a.w_inject = dwi;
+            a.lo = x.lo; a.rs = x.rs; a.inject_out = x.io; a.mixed = x.mix; a.xn = x.xn;
+            a.w_router = dwr; a.logits = x.logits; a.ids = x.ids; a.weights = x.w; a.xq = dxq;
+            a.w_gate_sh = dwgi; a.gate_sh = dgs; a.xq_sh = dxqs;
+            {
+                K::PdlScope ps(true);
+                K::hc_fused_read(a, s);
+            }
+            if (cudaStreamSynchronize(s) != cudaSuccess) {
+                std::printf("shared read failed: %s\n", cudaGetErrorString(cudaGetLastError()));
+                return 1;
+            }
+            const std::vector<float> v = fetch(1, T);
+            bool bad = !by_t[T].empty() && std::memcmp(v.data(), by_t[T].data(), v.size() * 4) != 0;
+            // xq_sh against native_quantize_q8_1 of the read's mixed
+            K::native_quantize_q8_1(x.mix, dxqn, N, T, s);
+            cudaStreamSynchronize(s);
+            std::vector<uint8_t> qs(K::native_q8_1_bytes(N, T)), qn(qs.size());
+            cudaMemcpy(qs.data(), dxqs, qs.size(), cudaMemcpyDeviceToHost);
+            cudaMemcpy(qn.data(), dxqn, qn.size(), cudaMemcpyDeviceToHost);
+            const bool qbad = std::memcmp(qs.data(), qn.data(), qs.size()) != 0;
+            // the shared expert both ways
+            K::NativeSharedWeights nw;
+            nw.gate_type = 14; nw.gate_data = dwg; nw.up_type = 14; nw.up_data = dwu8; nw.down_type = 8; nw.down_data = dwdn;
+            nw.q8_1 = dxqn;
+            K::shared_expert_multi(T, x.mix, nw, dwgi, dga, dupb, dgl, dold, N, FF, s);
+            nw.q8_1 = dxqs;
+            cudaEventRecord(evf, s);
+            cudaStreamWaitEvent(s2, evf, 0);
+            K::shared_expert_multi_rows(T, nw, dga, dupb, dnew, N, FF, s, s2, evj);
+            if (cudaStreamSynchronize(s) != cudaSuccess) {
+                std::printf("shared expert failed: %s\n", cudaGetErrorString(cudaGetLastError()));
+                return 1;
+            }
+            std::vector<float> yo((size_t) T * N), yn((size_t) T * N), gt(T);
+            cudaMemcpy(yo.data(), dold, yo.size() * 4, cudaMemcpyDeviceToHost);
+            cudaMemcpy(yn.data(), dnew, yn.size() * 4, cudaMemcpyDeviceToHost);
+            cudaMemcpy(gt.data(), dgs, (size_t) T * 4, cudaMemcpyDeviceToHost);
+            int ybad = 0, nonfin = 0;
+            for (int t = 0; t < T; ++t)
+                for (int i = 0; i < N; ++i) {
+                    volatile float p = yn[(size_t) t * N + i] * gt[t];
+                    const float pv = p;
+                    nonfin += !std::isfinite(yo[(size_t) t * N + i]);
+                    ybad += std::memcmp(&pv, &yo[(size_t) t * N + i], 4) != 0;
+                }
+            bad = bad || qbad || ybad != 0 || nonfin != 0;
+            if (bad)
+                std::printf("T %d: shared read differs (other outputs %s, xq_sh %s, %d of %d gated values, %d non-finite)\n",
+                            T, !by_t[T].empty() && std::memcmp(v.data(), by_t[T].data(), v.size() * 4) != 0 ? "differ" : "same",
+                            qbad ? "differs" : "same", ybad, T * N, nonfin);
+            sbad += bad;
+        }
+        std::printf("hc_fused_parity: %d window sizes where the shared expert's gate, rows or the read's outputs differ "
+                    "(must be 0)\n", sbad);
+        failures += sbad ? 1 : 0;
+        cudaEventDestroy(evf);
+        cudaEventDestroy(evj);
+        cudaStreamDestroy(s2);
+        for (void* p : {dwg, dwu8, dwdn, dxq, dxqs, dxqn, (void*) dwgi, (void*) dgs, (void*) dga, (void*) dupb, (void*) dgl,
+                        (void*) dold, (void*) dnew})
+            cudaFree(p);
+    }
 
     // --stress N: N reads of random window widths and token orders, 16 at a time with no host wait between them
     // (consecutive reads overlap through PDL); every output must equal the first read of the same (T, order)
@@ -534,6 +738,9 @@ int main(int argc, char** argv) {
         cudaStream_t sb;
         cudaStreamCreateWithFlags(&sb, cudaStreamNonBlocking);
         const std::string bs = block_list;
+        int dev_sms = 0, dev_id = 0;
+        cudaGetDevice(&dev_id);
+        cudaDeviceGetAttribute(&dev_sms, cudaDevAttrMultiProcessorCount, dev_id);
         size_t p0 = 0;
         int stuck = 0;
         while (p0 < bs.size()) {
@@ -542,6 +749,7 @@ int main(int argc, char** argv) {
             int T = 2, k = 0;
             std::sscanf(bs.substr(p0, p1 - p0).c_str(), "%d:%d", &T, &k);
             p0 = p1 + 1;
+            if (k >= dev_sms) continue;   // every SM held: nothing could run the read
             *(volatile int*) h_go = 0;
             *(volatile int*) h_started = 0;
             reset(1);

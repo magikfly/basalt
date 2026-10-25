@@ -6,6 +6,7 @@
 #pragma once
 
 #include <cstdint>
+#include <functional>
 #include <string>
 
 namespace basalt::platform {
@@ -16,8 +17,12 @@ struct LockResult {
     std::string note;            ///< what was done or why it failed, for the startup print
 };
 
-/// Lock [p, p + bytes) into physical memory. Partial success is reported, not hidden.
-LockResult lock_resident(void* p, uint64_t bytes);
+/// Called with the bytes locked so far, after each chunk of a lock that was given one.
+using LockProgress = std::function<void(uint64_t done)>;
+
+/// Lock [p, p + bytes) into physical memory. Partial success is reported, not hidden. With `progress` the region is
+/// locked in chunks (a prefix stays locked when a later chunk is refused) and `progress` hears each one finish.
+LockResult lock_resident(void* p, uint64_t bytes, const LockProgress& progress = nullptr);
 
 /// Undo lock_resident for the same region (best effort).
 void unlock_resident(void* p, uint64_t bytes);
@@ -31,9 +36,8 @@ void free_aligned(void* p);
 
 /// Asks the OS to give back what it holds for [off, off + bytes) of a mapped file view that starts at `base` and is
 /// `view_bytes` long: the range widened to whole pages, because those are what can be given back, and clipped to the
-/// view. False when the OS refused. Windows has no per-range release for a view of a file mapping - its pages are
-/// clean, since the view is read-only, so the manager takes them back on pressure by itself - and reports success
-/// without claiming anything.
+/// view. False when the OS refused or the range leaves the view. Windows takes the pages out of the process's working
+/// set (they then wait on the standby list as available memory) and does not report a refusal: it is a hint there.
 bool drop_mapped_view(const void* base, uint64_t view_bytes, uint64_t off, uint64_t bytes);
 
 /// What backs a host region from `alloc_region`.
@@ -126,6 +130,9 @@ void start_memory_watchdog(uint64_t floor_bytes);
 /// Tells the watchdog the load builds a resident RAM copy of the experts (`resident`) and how big it is so far, so
 /// its error names the copy's cap instead of the resident mode.
 void watch_resident_ram(bool resident, uint64_t copy_bytes);
+/// The line the watchdog prints when RAM runs out: `avail` bytes free, `resident` for the resident-copy mode with a
+/// copy of `copy_bytes`, `margin` the free RAM to keep. A budget flag is named only when it could shrink the copy.
+std::string ram_exhausted_message(uint64_t avail, bool resident, uint64_t copy_bytes, uint64_t margin);
 void stop_memory_watchdog();
 
 /// Whether an available-RAM reading of `avail` is below `floor` (a reading of 0, unknown, is not).
@@ -136,6 +143,12 @@ inline bool ram_below_floor(uint64_t avail, uint64_t floor) { return avail > 0 &
 void start_ram_guard(uint64_t floor_bytes);
 /// True while the last reading was below the guard's floor; `avail` and `floor` get that reading and the floor.
 bool ram_guard_low(uint64_t* avail = nullptr, uint64_t* floor = nullptr);
+/// A mapped file view the guard gives back (drop_mapped_view) when a reading comes within 1 GiB of its floor, then
+/// reads again, at most once every few seconds and only after the reading has risen above that lead since.
+/// Windows keeps a view's pages in the process once read and does not count them as available, where Linux counts
+/// them in MemAvailable; without this the guard would stop a request over pages the OS can reclaim.
+/// A null `base` withdraws the view; once that returns, the guard no longer touches it, so it can be unmapped.
+void ram_guard_reclaim_view(const void* base, uint64_t bytes);
 
 /// Whether the OS file cache could keep the `read_bytes` the expert file is read for, beside
 /// `arena_bytes` of RAM held by the engine's own copy of the experts and `margin` for everything else, with `avail`

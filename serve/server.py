@@ -29,8 +29,8 @@ from serve.engine.errors import EngineStartError  # noqa: E402
 from serve.engine.flags import flag_index  # noqa: E402
 from serve.engine.mock import MockEngine  # noqa: E402
 from serve.engine.process import ProcessEngine  # noqa: E402
-from serve.engine.vision import (EngineVision, Vision, child_env, engine_args, gpu_list, gpus_in_play,  # noqa: E402
-                                 peer_card, vision_env, vision_line)
+from serve.engine.vision import (EngineVision, Vision, check_gpu, child_env, engine_args, gpu_plan,  # noqa: E402
+                                 gpu_text, gpus_in_play, vision_card, vision_env, vision_line)
 from serve.frontend import ChatTemplate  # noqa: E402
 from serve.handler import Server, serve  # noqa: E402
 from serve.security import (LOOPBACK_NAMES, allowed_hosts_of, api_key_of, exposed_without_key,  # noqa: E402
@@ -79,11 +79,9 @@ def main() -> int:
                               TeeStream(ColorStream.wrap(sys.stderr), logs, "srv"))
     cfg = {}                                            # what the model file implies
     try:
-        if a.gpu is not None:
-            cfg["gpu"] = a.gpu
-            gpu_list(cfg)
+        check_gpu(a.gpu)
     except ValueError:
-        fail(f"--gpu {a.gpu}: expected numbers like 0 or 0,1")
+        fail(f"--gpu {gpu_text(a.gpu)}: expected numbers like 0 or 0,1, or auto")
     if not a.mock_engine and not (a.model and a.engine_bin):
         fail("the server needs --model and the engine binary: run it as basalt serve --config FILE (or --mock-engine)")
     if (file_engine or cli_engine) and not a.model:
@@ -92,7 +90,6 @@ def main() -> int:
         if not a.engine_bin:
             fail("--model needs --engine-bin BINARY")
         from serve.engine import modelfile
-        listed = gpu_list(cfg)
         try:
             known = engine_flags_of(a.engine_bin)
             check_engine_flags(file_engine, known, f"--config {a.config}")
@@ -103,11 +100,30 @@ def main() -> int:
         vision_arg = False if a.mock_engine or mode == "off" else mode
         try:
             cfg.update({k: v for k, v in modelfile.model_config(
-                a.model, a.engine_bin, gpus=len(listed) if listed else None, vision=vision_arg,
+                a.model, a.engine_bin, vision=vision_arg,
                 engine_words=file_engine + cli_engine).items()
                 if k not in cfg})
         except (OSError, ValueError, KeyError) as e:
             fail(f"{a.model}: {e}")
+        if not a.mock_engine:
+            # the engine's own choice, printed once here; the engine then sees only these cards, main first
+            try:
+                plan = gpu_plan(a.engine_bin, a.gpu)
+            except ValueError as e:
+                fail(f"gpu: {e}")
+            card = vision_card(mode)
+            if card is not None:                       # a numbered sidecar card, checked like gpu before it starts
+                try:
+                    gpu_plan(a.engine_bin, str(card))
+                except ValueError as e:
+                    fail(f"vision: {e}")
+            for note in plan.get("notes") or []:
+                print(f"[server] {note}", flush=True)
+            if plan.get("warning"):
+                print(f"[server] warning: {plan['warning']}", flush=True)
+            cfg["gpu"] = plan["devices"]
+            cfg["gpu_smi"] = [c.get("smi", -1) for c in plan.get("cards") or []]
+            cfg["args"] += ["--gpu", ",".join(str(i) for i in range(len(plan.get("cards") or [])))]
         if not a.mock_engine:
             print(engine_line(file_engine, cli_engine,
                                     (a.shared_context, a.parallel) if getattr(a, "shared_context", None) else None,
@@ -147,14 +163,11 @@ def main() -> int:
             del cfg["vision"]
         if cfg.get("vision"):
             mode = cfg["vision"].get("mode")
-            if mode == "peer" and peer_card(cfg) is None:
-                print("[server] warning: --vision peer needs a second GPU in --gpu; the encoder is loaded on the "
-                      "only GPU", flush=True)
             if mode == "dynamic":
                 vision = EngineVision(cfg["vision"])
             else:
                 vision = Vision(cfg["vision"], log=open(cfg["log"], "a", encoding="utf-8") if cfg.get("log") else None,
-                                env=vision_env(cfg, env, "on" if mode == "on" else "peer"))
+                                env=vision_env(env, mode))
         print(vision_line(cfg.get("vision"), cfg, vision.ready_s if vision else 0.0), flush=True)
         if lazy:
             print("[server] model unloaded, the first request loads it", flush=True)
@@ -211,6 +224,7 @@ def main() -> int:
                  "; warning: any web page can use the model (--api-key KEY)"), flush=True)
     svc.idle_unload_s = a.idle_unload or 0
     svc.min_free_vram_mib = a.min_free_vram_mib or 0
+    svc.reasoning_budget_tokens = a.reasoning_budget_tokens or 0
     svc.gpu_indices = gpus_in_play(cfg, engine_args(cfg) if not a.mock_engine else [])   # the cards /metrics reads
     svc.gpu_index = svc.gpu_indices[0]
     httpd = serve(svc, host=a.host, port=a.port)

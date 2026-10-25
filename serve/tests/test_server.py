@@ -5,6 +5,7 @@ import contextlib
 import io
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -1146,42 +1147,55 @@ class GpuChoice(unittest.TestCase):
         self.assertEqual(vision_line(None, {}), "[server] vision mode: off")
         cpu = vision_line({"gpu": False, "mode": "cpu"}, {}, 2.34)
         self.assertRegex(cpu, r"^\[server\] vision mode: cpu, \d+ threads, ready in 2\.3 s$")
-        self.assertEqual(vision_line({"gpu": True, "mode": "peer"}, {"gpu": "0,1"}, 5.0, name=name),
-                         "[server] vision mode: peer, GPU 1 (card1), ready in 5.0 s")
-        self.assertEqual(vision_line({"gpu": True, "mode": "peer"}, {"gpu": "0"}, 5.0, name=lambda i: None),
-                         "[server] vision mode: peer, GPU 0, ready in 5.0 s")
-        self.assertEqual(vision_line({"gpu": True, "mode": "on"}, {"gpu": "0,1"}, 5.0, name=name),
-                         "[server] vision mode: on, GPU 0 (card0), ready in 5.0 s")
+        self.assertEqual(vision_line({"gpu": True, "mode": "1"}, {"gpu": "0,1"}, 5.0, name=name),
+                         "[server] vision mode: GPU 1 (card1), ready in 5.0 s")
+        self.assertEqual(vision_line({"gpu": True, "mode": "2"}, {"gpu": "0"}, 5.0, name=lambda i: None),
+                         "[server] vision mode: GPU 2, ready in 5.0 s")
         self.assertEqual(vision_line({"gpu": True, "mode": "dynamic"}, {"gpu": "0,1"}, 0.0, name=name),
                          "[server] vision mode: dynamic, GPU 0 (card0), loads per image")
 
     def test_vision_device(self):
-        from unittest import mock
-        from serve.engine.vision import child_env, vision_env
-        cfg = {"gpu": "0,1"}
-        env = child_env(cfg)
-        venv = vision_env(cfg, env)                         # peer: the second card
-        self.assertEqual(venv["CUDA_VISIBLE_DEVICES"], "1")
-        self.assertEqual(venv["CUDA_DEVICE_ORDER"], "PCI_BUS_ID")
-        self.assertEqual(env["CUDA_VISIBLE_DEVICES"], "0,1")
-        main = vision_env(cfg, env, "on")                 # true: the model's own card
-        self.assertEqual(main["CUDA_VISIBLE_DEVICES"], "0")
-        self.assertEqual(main["CUDA_DEVICE_ORDER"], "PCI_BUS_ID")
-        self.assertIs(vision_env({"gpu": "0"}, env), env)   # one card listed: the engine's environment
-        self.assertIs(vision_env({"gpu": "0"}, env, "on"), env)
-        with mock.patch("serve.engine.modelfile.gpu_count", return_value=1):
-            self.assertIs(vision_env({}, env), env)         # none listed, one card
-        with mock.patch("serve.engine.modelfile.gpu_count", return_value=2):
-            self.assertEqual(vision_env({}, env)["CUDA_VISIBLE_DEVICES"], "1")
-            self.assertIs(vision_env({}, env, "on"), env)
+        from serve.engine.vision import child_env, vision_card, vision_env
+        env = child_env({"gpu": "0,1"})
+        pinned = vision_env(env, "2")                       # the sidecar's own card, in gpu's numbering
+        self.assertEqual(pinned["CUDA_VISIBLE_DEVICES"], "2")
+        self.assertEqual(pinned["CUDA_DEVICE_ORDER"], "PCI_BUS_ID")
+        self.assertEqual(vision_env(env, 2)["CUDA_VISIBLE_DEVICES"], "2")   # a number as well as a string
+        self.assertEqual(env["CUDA_VISIBLE_DEVICES"], "0,1")                # the engine's environment untouched
+        self.assertIs(vision_env(env, "cpu"), env)                          # the other modes inherit it
+        self.assertIs(vision_env(env, "dynamic"), env)
+        self.assertIsNone(vision_card("off"))
+        self.assertEqual(vision_card("3"), 3)
+
+    def test_gpu_plan(self):
+        from serve.engine.vision import check_gpu, gpu_plan, gpu_text
+        self.assertEqual(gpu_text([0, 1]), "0,1")
+        self.assertEqual(gpu_text(1), "1")
+        self.assertEqual(gpu_text(None), "")
+        for good in (None, "", "auto", "0", "1,0", [0, 1]):
+            check_gpu(good)
+        for bad in ("a,b", "0,0", "-1", "0,"):
+            with self.assertRaises(ValueError):
+                check_gpu(bad)
+        ok = mock.Mock(stdout='{"devices":"1,0","cards":[{"smi":1},{"smi":0}],"notes":[],"warning":"","error":""}\n')
+        with mock.patch("subprocess.run", return_value=ok) as run:
+            self.assertEqual(gpu_plan("/x/basalt", "1,0")["devices"], "1,0")
+            self.assertEqual(run.call_args.args[0], ["/x/basalt", "--gpu-plan", "--gpu", "1,0"])
+            gpu_plan("/x/basalt", None)
+            self.assertEqual(run.call_args.args[0], ["/x/basalt", "--gpu-plan"])
+        bad = mock.Mock(stdout='{"devices":"","cards":[],"notes":[],"warning":"","error":"gpu 2: 2 GPUs are visible (0-1)"}')
+        with mock.patch("subprocess.run", return_value=bad), self.assertRaisesRegex(ValueError, "2 GPUs are visible"):
+            gpu_plan("/x/basalt", "2")
+        with mock.patch("subprocess.run", side_effect=OSError), self.assertRaisesRegex(ValueError, "--gpu-plan"):
+            gpu_plan("/x/basalt", "auto")
 
     def test_vision_modes(self):
         from serve.engine.vision import vision_mode
-        for given, want in ((None, "off"), ("off", "off"), ("on", "on"), ("Peer", "peer"), ("dynamic", "dynamic"),
-                            ("cpu", "cpu")):
+        for given, want in ((None, "off"), ("off", "off"), ("dynamic", "dynamic"), ("cpu", "cpu"),
+                            ("2", "2"), (1, "1"), ("01", "1")):
             self.assertEqual(vision_mode(given), want)
-        for bad in (True, False, "true", "false", "gpu"):
-            with self.assertRaisesRegex(ValueError, "vision: use one of on, off, peer, dynamic, cpu"):
+        for bad in (True, False, "true", "false", "gpu", "on", "peer", "-1", "1.5", "٢", "²"):
+            with self.assertRaisesRegex(ValueError, "vision: use one of off, dynamic, cpu or a GPU number"):
                 vision_mode(bad)
 
 
@@ -1533,6 +1547,40 @@ class StartFailureLog(unittest.TestCase):
         self.assertIsNone(engine_error("basalt error: "))
         self.assertIsNone(engine_error("basalt warning: x"))
 
+    def test_marked_lines_of_any_area(self):
+        from serve.engine.progress import engine_error, engine_ram_floor, engine_warning, start_errors
+        self.assertEqual(engine_error("basalt generate: error: the weight arena failed"), "the weight arena failed")
+        self.assertEqual(engine_error("basalt: error: dec_moe_vram: formats 1 / 2"), "dec_moe_vram: formats 1 / 2")
+        self.assertIsNone(engine_error("basalt generate: warning: x"))
+        self.assertIsNone(engine_error("basalt generate: no error here, nothing failed"))
+        self.assertIsNone(engine_error("CUDA error: out of memory"))
+        self.assertEqual(engine_warning("basalt serve: warning: model 60.0 GiB"), "model 60.0 GiB")
+        self.assertEqual(engine_warning("basalt warning: older form"), "older form")
+        self.assertIsNone(engine_warning("basalt generate: WARNING: not a marker"))
+        self.assertIsNone(engine_warning("basalt serve: warning: "))
+        self.assertEqual(engine_ram_floor("basalt generate: RAM floor 4.0 GiB"), "4.0 GiB")
+        self.assertIsNone(engine_ram_floor("basalt serve: RAM floor 4.0 GiB"))
+        with tempfile.TemporaryDirectory() as d:
+            log = Path(d) / "engine.log"
+            log.write_text("basalt generate: error: an earlier start\n", encoding="utf-8")
+            off = log.stat().st_size
+            with open(log, "a", encoding="utf-8") as f:
+                f.write("basalt generate: GPU 0\nbasalt generate: warning: slow\nbasalt generate: error: first\n"
+                        "basalt serve: error: second\nbasalt serve: no error\n")
+            self.assertEqual(start_errors(str(log), off), ["first", "second"])
+            from serve.engine.progress import start_last_line
+            self.assertEqual(start_last_line(str(log), off), "no error")
+
+    def test_the_draft_head_hint_reads_marked_lines(self):
+        d = tempfile.mkdtemp()
+        p = Path(d) / "engine.log"
+        p.write_text("basalt mtp: warning: the draft head over 106299 tokens needs 348 MiB of VRAM and 120 MiB is free.\n"
+                     "basalt mtp: hint: free VRAM (...)\n"
+                     "basalt serve: error: mtp: the draft head does not fit\n", encoding="utf-8")
+        h = start_failure_hint(str(p), 0)
+        self.assertIn("348 MiB", h)
+        self.assertIn("free VRAM", h)
+
 
 class Tty(io.StringIO):
     def isatty(self):
@@ -1635,6 +1683,91 @@ class LoadProgress(unittest.TestCase):
         bars.update("cuda1", 0, 1 << 30)                                # planned after ram, loads before it
         bars.update("ram", 0, 2 << 30)
         self.assertEqual([r.split(" [")[0].split()[-1] for r in bars.lines()], ["cuda2", "cuda3", "ram"])
+
+    def test_the_ngram_table_lock_is_its_own_row_outside_the_total(self):
+        from serve.engine.progress import LoadBars, load_progress
+        self.assertEqual(load_progress("basalt load: ngram 1073741824 3221225472"), ("ngram", 1 << 30, 3 << 30, False))
+        out = Tty()
+        bars = LoadBars(out, gpus=[2, 3])
+        bars.set_total(2 << 30)
+        bars.set_plan("cuda0", 2 << 30)
+        bars.update("cuda0", 2 << 30, 2 << 30)
+        bars.update("ngram", 1 << 30, 3 << 30)                          # no plan line: the total is the plan
+        rows = [r.split("\x1b[2K")[-1] for r in out.getvalue().splitlines()[-2:]]
+        self.assertEqual(rows[0], "[server] loading weights into cuda2".ljust(49) + " [" + "=" * 24 + "]   2.0/2.0 GiB")
+        self.assertEqual(rows[1], "[server] loading the n-gram table into system ram [" + "=" * 8 + ">" + " " * 15 + "]   1.0/3.0 GiB")
+        bars.update("ngram", 3 << 30, 3 << 30)
+        bars.finish()
+        self.assertIn("[server] loaded 2.0 GiB in ", out.getvalue())     # the table is not part of the loaded bytes
+        self.assertIn("(cuda2 2.0 GiB)", out.getvalue())
+
+    @staticmethod
+    def _screen(raw: str) -> list[str]:
+        """What a terminal shows after `raw`: cursor-up and erase-line moves applied to the written lines."""
+        rows, r = [""], 0
+        for part in re.split(r"(\x1b\[1A|\x1b\[2K|\n)", raw):
+            if part == "\x1b[1A":
+                r = max(0, r - 1)
+            elif part == "\x1b[2K":
+                rows[r] = ""
+            elif part == "\n":
+                r += 1
+                rows += [""] * (r + 1 - len(rows))
+            else:
+                rows[r] += part
+        return [x for x in rows if x]
+
+    def _ple_ram_start(self, out, foreign):
+        """The line sequence of a start with the n-gram table in RAM: the table rows come while cuda0 is loading."""
+        from serve.engine import progress
+        from serve.engine.progress import LoadBars
+        G = 1 << 30
+        bars = progress._active = LoadBars(out, gpus=[0, 1])
+        try:
+            bars.set_total(40 * G)
+            bars.set_plan("cuda0", 30 * G)
+            bars.set_plan("ram", 10 * G)
+            for k in range(1, 6):
+                bars.update("cuda0", 5 * G * k, 30 * G)
+            for k in range(0, 4):
+                bars.update("ngram", 18 * G * k // 3 * 1, 18 * G)
+                bars.update("cuda0", (25 + k) * G, 30 * G)
+            bars.update("cuda0", 30 * G, 30 * G)
+            bars.update("ram", 10 * G, 10 * G)
+            bars.update("ngram", 18 * G, 18 * G)
+            if foreign:
+                progress.server_line("[server] auto flags: spec 7")
+            bars.finish()
+        finally:
+            progress._active = None
+
+    def test_no_live_row_is_left_after_the_loaded_line(self):
+        for foreign in (False, True):
+            out = Tty()
+            self._ple_ram_start(out, foreign)
+            shown = self._screen(out.getvalue())
+            self.assertEqual(len([x for x in shown if "loading" in x]), 0, shown)
+            self.assertTrue(shown[0].startswith("[server] auto flags") if foreign else shown[0].startswith("[server] loaded"), shown)
+            self.assertTrue(any(x.startswith("[server] loaded") for x in shown), shown)
+
+    def test_the_ngram_row_is_drawn_while_the_table_loads(self):
+        out = Tty()
+        from serve.engine.progress import LoadBars
+        bars = LoadBars(out)
+        bars.set_plan("cuda0", 4 << 30)
+        bars.update("cuda0", 3 << 30, 4 << 30)
+        bars.update("ngram", 1 << 30, 3 << 30)
+        shown = self._screen(out.getvalue())
+        self.assertEqual([x.split(" [")[0].rstrip() for x in shown],
+                         ["[server] loading weights into cuda0", "[server] loading the n-gram table into system ram"])
+
+    def test_off_a_terminal_only_the_result_line_prints(self):
+        out = io.StringIO()
+        self._ple_ram_start(out, True)
+        lines = out.getvalue().splitlines()
+        self.assertEqual(len(lines), 2, lines)
+        self.assertTrue(lines[0].startswith("[server] auto flags") and lines[1].startswith("[server] loaded 40.0 GiB"))
+        self.assertNotIn("\x1b", out.getvalue())
 
     def test_kv_is_a_line_after_the_result_and_not_a_load(self):
         from serve.engine.progress import LoadBars, load_kv, load_progress
@@ -2638,13 +2771,37 @@ class ThinkingBudget(unittest.TestCase):
         self.assertEqual(len(self.engine.prompts), 1)
 
     def test_the_config_default_and_a_request_that_turns_it_off(self):
-        self.svc.reasoning_budget_tokens = 20
+        self.svc.reasoning_budget_tokens = 20                          # what --reasoning-budget-tokens sets
         code, b = self.openai()
         self.assertEqual(len(self.engine.prompts), 2)
         self.assertTrue(b["choices"][0]["message"]["reasoning_content"].startswith(ThinkingEngine.THOUGHT[:20] + "\n"))
         code, b = self.openai(reasoning_budget_tokens=0)
         self.assertEqual(b["choices"][0]["message"]["reasoning_content"], ThinkingEngine.THOUGHT)
         self.assertEqual(len(self.engine.prompts), 3)
+
+    def test_the_launch_default_applies_on_the_anthropic_path_too(self):
+        self.svc.reasoning_budget_tokens = 20
+        code, raw = self.post("/v1/messages", {"model": "qwen3.8-flash-next", "max_tokens": 400, "stream": True,
+                                                "messages": [{"role": "user", "content": "2+2?"}]})
+        self.assertEqual(code, 200)
+        self.assertEqual(self.anthropic_thinking(raw).startswith(ThinkingEngine.THOUGHT[:20]), True)
+
+    def anthropic_thinking(self, raw):
+        evs = [json.loads(line[6:]) for line in raw.splitlines() if line.startswith("data: {")]
+        return "".join(e["delta"].get("thinking", "") for e in evs if e["type"] == "content_block_delta")
+
+    def test_anthropics_budget_tokens_is_the_same_budget(self):
+        from serve.service import REASONING_WRAP_UP
+        wrap = REASONING_WRAP_UP.split("</think>")[0]
+        body = {"model": "qwen3.8-flash-next", "max_tokens": 400, "stream": True,
+                "messages": [{"role": "user", "content": "2+2?"}]}
+        code, raw = self.post("/v1/messages", {**body, "thinking": {"type": "enabled", "budget_tokens": 30}})
+        self.assertEqual(code, 200)
+        self.assertEqual(self.anthropic_thinking(raw), ThinkingEngine.THOUGHT[:30] + wrap)
+        # a budget the request spells out itself wins over Anthropic's
+        code, raw = self.post("/v1/messages", {**body, "reasoning_budget_tokens": 10,
+                                               "thinking": {"type": "enabled", "budget_tokens": 30}})
+        self.assertEqual(self.anthropic_thinking(raw), ThinkingEngine.THOUGHT[:10] + wrap)
 
     def test_without_thinking_there_is_nothing_to_limit(self):
         self.engine.THOUGHT = ""

@@ -182,6 +182,8 @@ def check_engine_flags(words: list[str], known: set[str] | None, where: str) -> 
     """ValueError naming the first flag (a word starting with `--`) the engine rejects; value words are not names
     (unchecked when the binary is unreadable)."""
     for word in words:
+        if word == "--gpu":
+            raise ValueError(f"{where}: gpu is a server setting (--gpu, or \"gpu\" in the server section)")
         if known is not None and word.startswith("--") and word not in known:
             raise ValueError(f"{where}: {word} is not an engine flag")
 
@@ -306,6 +308,17 @@ def parallel_count(text: str) -> int:
     return n
 
 
+def budget_count(text: str) -> int:
+    """argparse type: a thinking budget in tokens, a whole number >= 0 (0: none)."""
+    try:
+        n = int(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"expected a whole number >= 0, not {text!r}") from None
+    if n < 0:
+        raise argparse.ArgumentTypeError(f"expected a whole number >= 0, not {n}")
+    return n
+
+
 def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter,
                                  allow_abbrev=False)
@@ -327,11 +340,10 @@ def build_parser() -> argparse.ArgumentParser:
                          "without the dashes, e.g. \"engine\": {\"max-context\": 32768, \"spec\": 7, "
                          "\"resident-experts\": true}; a list gives a flag several values; the command line "
                          "wins over it")
-    ap.add_argument("--vision", nargs="?", const="", default="off", type=vision_setting, choices=VISION_MODES, metavar="MODE",
-                    help="image input: off (default), on (the encoder always on the main GPU, ~2.2 GiB of VRAM), "
-                         "peer (always on the second GPU), dynamic (inside the engine: it borrows expert-cache slots "
-                         "on the main GPU while it reads an image, no standing VRAM) or cpu (no VRAM, slow); a value is "
-                         "required")
+    ap.add_argument("--vision", nargs="?", const="", default="off", type=vision_setting, metavar="MODE|GPU",
+                    help="image input: off (default), dynamic (inside the engine: it borrows expert-cache slots "
+                         "on the main GPU while it reads an image, no standing VRAM), cpu (no VRAM, slow) or a "
+                         "GPU number, as nvidia-smi numbers them: the encoder sidecar, always on that card")
     ap.add_argument("--host", default="127.0.0.1",
                     help="the address to listen on: 127.0.0.1 = this PC only (the default), 0.0.0.0 = also other "
                          "devices on your network (give --api-key)")
@@ -339,8 +351,9 @@ def build_parser() -> argparse.ArgumentParser:
                     help="the mock engine's answer (default: a short greeting); given more than once, requests get "
                          "them in turn and the last one repeats")
     ap.add_argument("--port", type=int, default=8080, help="the TCP port to listen on (default 8080)")
-    ap.add_argument("--gpu", help="the GPUs to use, as nvidia-smi numbers them: the first runs the model, a second is "
-                                  "the peer expert tier (\"0,1\"; default: every visible GPU)")
+    ap.add_argument("--gpu", help="the GPUs to use, as nvidia-smi numbers them: exactly these, the first is the main "
+                                  "card and the engine gives the rest their roles (\"0,1\"); auto = every Blackwell "
+                                  "card, the fastest as main (default: GPU 0 alone)")
     ap.add_argument("--tokenizer", default=str(ROOT / "pack/full/tokenizer"),
                     help="tokenizer directory for the mock engine (a byte tokenizer if absent)")
     ap.add_argument("--open", action="store_true", help="open the local page in the browser once the model is ready")
@@ -377,4 +390,8 @@ def build_parser() -> argparse.ArgumentParser:
                         help=f"default {key.replace('-', '_')} for requests that leave it out, over the model file's: {text}")
     ap.add_argument("--min-free-vram-mib", type=int, default=None,
                     help="load an unloaded model only when this much VRAM is free, else answer 503")
+    ap.add_argument("--reasoning-budget-tokens", type=budget_count, default=None, metavar="N",
+                    help="default thinking budget for requests that leave reasoning_budget_tokens out (0 = none): at "
+                         "the budget the thinking is closed and the answer starts, so set it below the request's "
+                         "max_tokens")
     return ap

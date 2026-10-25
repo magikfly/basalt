@@ -13,7 +13,22 @@ import unittest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from serve.config import build_parser, check_engine_flags, engine_flags_of, engine_line, load_config_file, parallel_count, parse_settings, SAMPLING_KEYS, sampling_defaults_from_config, sampling_line, server_options, split_engine_extras  # noqa: E402
+from serve.config import (  # noqa: E402
+    SAMPLING_KEYS,
+    budget_count,
+    build_parser,
+    check_engine_flags,
+    engine_flags_of,
+    engine_line,
+    load_config_file,
+    parallel_count,
+    parse_settings,
+    sampling_defaults_from_config,
+    sampling_line,
+    server_options,
+    split_engine_extras,
+    vision_setting,
+)
 from serve.engine.flags import flag_value  # noqa: E402
 from serve.security import exposed_without_key  # noqa: E402
 
@@ -53,11 +68,11 @@ def engine_parser_flags() -> dict:
 class ConfigFile(unittest.TestCase):
     def test_server_and_engine_sections(self):
         ap = build_parser()
-        argv, engine = load_config_file(conf({"server": {"port": 9000, "vision": "on", "lazy": False,
+        argv, engine = load_config_file(conf({"server": {"port": 9000, "vision": 2, "lazy": False,
                                                          "allowed-host": ["a", "b"], "--gpu": "0,1"},
                                               "engine": {"max-context": 32768, "--kv": "int8",
                                                          "resident-experts": True}}), ap)
-        self.assertEqual(argv, ["--port", "9000", "--vision", "on", "--allowed-host", "a", "--allowed-host", "b",
+        self.assertEqual(argv, ["--port", "9000", "--vision", "2", "--allowed-host", "a", "--allowed-host", "b",
                                 "--gpu", "0,1"])
         self.assertEqual(engine, ["--max-context", "32768", "--kv", "int8", "--resident-experts"])
 
@@ -73,9 +88,9 @@ class ConfigFile(unittest.TestCase):
                          ({"server": {"nope": 1}}, "not a server option"),
                          ({"server": {"spec": 7}}, "not a server option \\(engine flags go under"),
                          ({"server": {"engine-bin": "/x/basalt"}}, "engine-bin is set by basalt serve"),
-                         ({"server": {"vision": "yes"}}, "vision: use one of on, off, peer, dynamic, cpu"),
-                         ({"server": {"vision": True}}, "vision: use one of on, off, peer, dynamic, cpu"),
-                         ({"server": {"vision": False}}, "vision: use one of on, off, peer, dynamic, cpu"),
+                         ({"server": {"vision": "yes"}}, "vision: use one of off, dynamic, cpu or a GPU number"),
+                         ({"server": {"vision": True}}, "vision: use one of off, dynamic, cpu or a GPU number"),
+                         ({"server": {"vision": False}}, "vision: use one of off, dynamic, cpu or a GPU number"),
                          ({"server": {"port": [1]}}, "one value"),
                          ({"server": {"config": "x"}}, "not a server option"),
                          ({"engine": {"port": 1}}, "a server option"),
@@ -161,9 +176,15 @@ class Precedence(unittest.TestCase):
                                                   "--control-vector-layer-range", "1", "2"])
 
     def test_negative_value_words(self):
-        _, _, _, cli_words = parse(["--peer-device", "-1", "--x=-2"])
-        self.assertEqual(cli_words, ["--peer-device", "-1", "--x", "-2"])
-        check_engine_flags(cli_words, {"--peer-device", "--x"}, "cli")
+        _, _, _, cli_words = parse(["--vram-reserve-mib", "-1", "--x=-2"])
+        self.assertEqual(cli_words, ["--vram-reserve-mib", "-1", "--x", "-2"])
+        check_engine_flags(cli_words, {"--vram-reserve-mib", "--x"}, "cli")
+
+    def test_gpu_is_a_server_setting(self):
+        with self.assertRaisesRegex(ValueError, "cli: --peer-device is not an engine flag"):
+            check_engine_flags(["--peer-device", "1"], {"--gpu"}, "cli")
+        with self.assertRaisesRegex(ValueError, "gpu is a server setting"):
+            check_engine_flags(["--gpu", "0,1"], {"--gpu"}, "--config c.json")
 
     def test_extras(self):
         self.assertEqual(split_engine_extras(["--kv", "int8", "--resident-experts", "--seed=3", "--x", "-1"]),
@@ -243,6 +264,19 @@ class SamplingOptions(unittest.TestCase):
                          "[server] sampling defaults: temperature=0.8 (command line), top_k=20 (config), top_p=0.9")
 
 
+class ThinkingBudget(unittest.TestCase):
+    """reasoning-budget-tokens is the launch default for the request field of the same name; the field itself and
+    what a budget does to a reply are covered in test_server's ThinkingBudget (Service level)."""
+
+    def test_left_out_the_request_decides(self):
+        self.assertIsNone(parse([])[0].reasoning_budget_tokens)
+
+    def test_a_bad_budget_is_refused(self):
+        for bad in ("-1", "-3072", "lots", "1.5", ""):
+            with self.subTest(value=bad), self.assertRaises(SystemExit):
+                parse(["--reasoning-budget-tokens", bad])
+
+
 class SlotContext(unittest.TestCase):
     """--max-context is shared by the --parallel slots unless --slot-full-context."""
 
@@ -288,8 +322,10 @@ class EveryOption(unittest.TestCase):
             return True
         if act.choices:
             return [c for c in act.choices][-1]
-        if act.type is int or act.type is parallel_count:
+        if act.type is int or act.type is parallel_count or act.type is budget_count:
             return 7
+        if act.type is vision_setting:                      # --vision: a GPU number is a valid sample
+            return "1"
         if act.type is float:
             return 0.25
         if act.dest in SAMPLING_KEYS:                      # the model file's checks apply

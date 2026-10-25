@@ -7,6 +7,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
+#include <mutex>
 #include <string>
 #include <thread>
 #if defined(_WIN32)
@@ -21,6 +22,7 @@
 #endif
 #include <cerrno>
 #include <cstring>
+#include "basalt/log.hpp"
 
 namespace basalt::platform {
 
@@ -42,7 +44,7 @@ void enable_privilege(LPCWSTR name) {
 }  // namespace
 #endif
 
-LockResult lock_resident(void* p, uint64_t bytes) {
+LockResult lock_resident(void* p, uint64_t bytes, const LockProgress& progress) {
     LockResult r;
     if (p == nullptr || bytes == 0) { r.note = "nothing to lock"; return r; }
 #if defined(_WIN32)
@@ -52,9 +54,8 @@ LockResult lock_resident(void* p, uint64_t bytes) {
     SIZE_T min_ws = 0, max_ws = 0;
     DWORD flags = 0;
     // Locked pages count against the minimum working set, so it has to grow by the region plus room for the rest of
-    // the process first. Both limits are soft, so raising the minimum reserves without pinning the process to it.
-    // A quota that cannot be raised is reported and the lock tried anyway: whatever the existing quota covers is
-    // still worth having.
+    // the process first: VirtualLock can lock no more pages than that minimum holds. A quota that cannot be raised
+    // is reported and the lock tried anyway: whatever the existing quota covers is still worth having.
     std::string quota_note;
     if (!GetProcessWorkingSetSizeEx(self, &min_ws, &max_ws, &flags)) {
         quota_note = "GetProcessWorkingSetSizeEx failed (error " + std::to_string(GetLastError()) + ")";
@@ -62,13 +63,15 @@ LockResult lock_resident(void* p, uint64_t bytes) {
         const SIZE_T margin = (SIZE_T) 512 << 20;
         const SIZE_T new_min = min_ws + (SIZE_T) bytes + margin;
         const SIZE_T new_max = max_ws > new_min + margin ? max_ws : new_min + margin;
+        // The minimum goes in as the hard limit: only a hard minimum keeps the locked pages from being trimmed back
+        // out. The maximum stays soft, so the process can still grow past it.
         if (!SetProcessWorkingSetSizeEx(self, new_min, new_max,
-                                        QUOTA_LIMITS_HARDWS_MIN_DISABLE | QUOTA_LIMITS_HARDWS_MAX_DISABLE))
+                                        QUOTA_LIMITS_HARDWS_MIN_ENABLE | QUOTA_LIMITS_HARDWS_MAX_DISABLE))
             quota_note = "SetProcessWorkingSetSizeEx(" + std::to_string((unsigned long long) (new_min >> 20)) +
                          " MiB) failed (error " + std::to_string(GetLastError()) + ")";
     }
     // Chunked, because one call over the whole region loses everything past the first page that does not fit.
-    const uint64_t chunk = 1ull << 30;
+    const uint64_t chunk = progress ? 256ull << 20 : 1ull << 30;
     uint8_t* base = (uint8_t*) p;
     for (uint64_t off = 0; off < bytes; off += chunk) {
         const uint64_t n = bytes - off < chunk ? bytes - off : chunk;
@@ -81,6 +84,7 @@ LockResult lock_resident(void* p, uint64_t bytes) {
             return r;
         }
         r.locked_bytes = off + n;
+        if (progress) progress(r.locked_bytes);
     }
     r.ok = true;
     const std::string locked = std::to_string((unsigned long long) (bytes >> 20)) + " MiB";
@@ -88,9 +92,25 @@ LockResult lock_resident(void* p, uint64_t bytes) {
                                 : quota_note + "; locked " + locked + " with the quota already in place";
     return r;
 #else
-    if (mlock(p, bytes) != 0) { r.note = "mlock failed (raise ulimit -l)"; return r; }
+    if (!progress) {
+        if (mlock(p, bytes) != 0) { r.note = "mlock failed (raise ulimit -l)"; return r; }
+        r.ok = true;
+        r.locked_bytes = bytes;
+        r.note = "mlock";
+        return r;
+    }
+    const uint64_t chunk = 256ull << 20;
+    for (uint64_t off = 0; off < bytes; off += chunk) {
+        const uint64_t n = bytes - off < chunk ? bytes - off : chunk;
+        if (mlock((uint8_t*) p + off, (size_t) n) != 0) {
+            r.note = "mlock failed (raise ulimit -l)";
+            r.ok = off > 0;   // what it did lock stays locked; the rest of the region is merely pageable
+            return r;
+        }
+        r.locked_bytes = off + n;
+        progress(r.locked_bytes);
+    }
     r.ok = true;
-    r.locked_bytes = bytes;
     r.note = "mlock";
     return r;
 #endif
@@ -187,6 +207,26 @@ std::atomic<bool> g_resident_mode{false};
 std::atomic<uint64_t> g_resident_copy{0};
 }  // namespace
 
+std::string ram_exhausted_message(uint64_t avail, bool resident, uint64_t copy_bytes, uint64_t margin) {
+    const unsigned long long mib = (unsigned long long) (avail >> 20);
+    char buf[384];
+    if (!resident) {
+        std::snprintf(buf, sizeof buf, "basalt error: RAM ran out loading (%llu MiB free); use "
+                                       "--resident-experts or --mmap-experts", mib);
+    } else if (copy_bytes < (1ull << 30)) {
+        // a budget of 1 GiB or more would not shrink a copy this small, so it is not offered
+        std::snprintf(buf, sizeof buf, "basalt error: RAM ran out loading (%llu MiB free); the resident copy is only "
+                                       "%llu MiB, so something else is holding the memory (other programs, or file "
+                                       "pages read while loading)", mib, (unsigned long long) (copy_bytes >> 20));
+    } else {
+        // the copy shrunk by what the margin is short of leaves the margin free again
+        const uint64_t keep = copy_bytes - std::min(copy_bytes, margin > avail ? margin - avail : 0);
+        std::snprintf(buf, sizeof buf, "basalt error: RAM ran out loading (%llu MiB free); use --resident-budget-gib %llu",
+                      mib, (unsigned long long) std::max<uint64_t>(1, keep >> 30));
+    }
+    return buf;
+}
+
 void watch_resident_ram(bool resident, uint64_t copy_bytes) {
     g_resident_mode = resident;
     g_resident_copy = copy_bytes;
@@ -199,18 +239,8 @@ void start_memory_watchdog(uint64_t floor_bytes) {
         while (!g_watch_stop.load()) {
             const uint64_t avail = available_memory();
             if (avail > 0 && avail < floor_bytes) {
-                const unsigned long long mib = (unsigned long long) (avail >> 20);
-                if (g_resident_mode.load()) {
-                    // the copy shrunk by what the margin is short of leaves the margin free again
-                    const uint64_t copy = g_resident_copy.load(), margin = ram_margin();
-                    const uint64_t keep = copy - std::min(copy, margin > avail ? margin - avail : 0);
-                    std::fprintf(stderr, "basalt error: RAM ran out loading (%llu MiB free); use "
-                                         "--resident-budget-gib %llu\n", mib, (unsigned long long) std::max<uint64_t>(1, keep >> 30));
-                } else {
-                    std::fprintf(stderr, "basalt error: RAM ran out loading (%llu MiB free); use "
-                                         "--resident-experts or --mmap-experts\n", mib);
-                }
-                std::fflush(stderr);
+                basalt::log::error("basalt", "%s", ram_exhausted_message(avail, g_resident_mode.load(), g_resident_copy.load(),
+                                                                   ram_margin()).c_str());
                 _exit(1);
             }
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
@@ -228,22 +258,83 @@ std::atomic<bool> g_guard_on{false};
 std::atomic<bool> g_guard_low{false};
 std::atomic<uint64_t> g_guard_avail{0};
 std::atomic<uint64_t> g_guard_floor{0};
+#if defined(_WIN32)
+constexpr uint64_t kReclaimLead = 1ull << 30;       // how far above the floor the guard gives the view back
+constexpr uint64_t kReclaimChunk = 256ull << 20;    // bytes given back per lock hold
+constexpr auto kReclaimCooldown = std::chrono::seconds(5);
+std::mutex g_reclaim_mu;                            // held per chunk, so a withdrawn view is not touched afterwards
+const void* g_reclaim_base = nullptr;
+uint64_t g_reclaim_bytes = 0;
+
+// Gives the registered view back in chunks, releasing the lock between them so a withdrawal waits for one chunk.
+void reclaim_view_now() {
+    const void* base;
+    uint64_t bytes;
+    {
+        std::lock_guard<std::mutex> lock(g_reclaim_mu);
+        base = g_reclaim_base;
+        bytes = g_reclaim_bytes;
+    }
+    for (uint64_t off = 0; base != nullptr && off < bytes; off += kReclaimChunk) {
+        std::lock_guard<std::mutex> lock(g_reclaim_mu);
+        if (g_reclaim_base != base) return;
+        (void) drop_mapped_view(base, bytes, off, std::min(kReclaimChunk, bytes - off));
+    }
+}
+#endif
 }  // namespace
+
+void ram_guard_reclaim_view(const void* base, uint64_t bytes) {
+#if defined(_WIN32)
+    std::lock_guard<std::mutex> lock(g_reclaim_mu);
+    g_reclaim_base = bytes > 0 ? base : nullptr;
+    g_reclaim_bytes = g_reclaim_base != nullptr ? bytes : 0;
+#else
+    (void) base, (void) bytes;   // MemAvailable already counts a view's pages
+#endif
+}
 
 void start_ram_guard(uint64_t floor_bytes) {
     g_guard_floor = floor_bytes;
     if (g_guard_on.exchange(true)) return;
     std::thread([] {
         bool was_low = false;
+#if defined(_WIN32)
+        bool rearmed = true, logged_reclaim = false;
+        auto last_reclaim = std::chrono::steady_clock::now() - kReclaimCooldown;
+#endif
         for (;;) {
-            const uint64_t avail = available_memory(), floor = g_guard_floor.load();
+            uint64_t avail = available_memory();
+            const uint64_t floor = g_guard_floor.load();
+#if defined(_WIN32)
+            // Give the view back at most once per cooldown, and again only after the reading has been above the lead.
+            if (!ram_below_floor(avail, floor + kReclaimLead)) {
+                rearmed = true;
+            } else if (rearmed && std::chrono::steady_clock::now() - last_reclaim >= kReclaimCooldown) {
+                bool have;
+                {
+                    std::lock_guard<std::mutex> lock(g_reclaim_mu);
+                    have = g_reclaim_base != nullptr;
+                }
+                if (have) {
+                    if (!logged_reclaim) {
+                        basalt::log::info("basalt", "RAM guard: mapped experts view given back at %llu MiB free",
+                                     (unsigned long long) (avail >> 20));
+                        logged_reclaim = true;
+                    }
+                    reclaim_view_now();
+                    avail = available_memory();
+                    rearmed = false;
+                    last_reclaim = std::chrono::steady_clock::now();
+                }
+            }
+#endif
             const bool low = ram_below_floor(avail, floor);
             g_guard_avail = avail;
             g_guard_low = low;
             if (low && !was_low) {
-                std::fprintf(stderr, "basalt warning: RAM low: %llu MiB free < %llu MiB guard\n",
+                basalt::log::warn("basalt", "RAM low: %llu MiB free < %llu MiB guard",
                              (unsigned long long) (avail >> 20), (unsigned long long) (floor >> 20));
-                std::fflush(stderr);
             }
             was_low = low;
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
@@ -343,9 +434,17 @@ void free_aligned(void* p) {
 bool drop_mapped_view(const void* base, uint64_t view_bytes, uint64_t off, uint64_t bytes) {
     if (base == nullptr || bytes == 0) return true;
 #if defined(_WIN32)
-    // A view of a file mapping has no per-range release. Its pages are clean, so the manager takes them back on
-    // pressure by itself, and nothing here claims they were freed.
-    (void) view_bytes; (void) off;
+    // Unlocking a range that is not locked takes its pages out of this process's working set, which is the only
+    // per-range release a view has: a clean page then waits on the standby list, counted as available, and is read
+    // back from the file if touched again. The call reports ERROR_NOT_LOCKED for pages that were never locked even
+    // though they were released, so its result carries nothing and a range the OS declines is simply left alone.
+    if (off > view_bytes || bytes > view_bytes - off) return false;
+    const uintptr_t pg = page_bytes();
+    const uintptr_t first = ((uintptr_t) base + (uintptr_t) off) & ~(pg - 1);
+    const uintptr_t last = ((uintptr_t) base + (uintptr_t) (off + bytes) + pg - 1) & ~(pg - 1);
+    constexpr uintptr_t kStep = (uintptr_t) 1 << 30;
+    for (uintptr_t a = first; a < last; a += kStep)
+        (void) VirtualUnlock((LPVOID) a, (SIZE_T) std::min<uintptr_t>(kStep, last - a));
     return true;
 #else
     // Only whole pages can be given back: a page the range shares with a neighbour still holds bytes the caller may

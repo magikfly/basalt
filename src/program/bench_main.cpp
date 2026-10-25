@@ -22,12 +22,16 @@
 #include <string>
 #include <vector>
 
+#include "basalt/platform/cpu.hpp"
 #include "basalt/platform/dynlib.hpp"
 #include "basalt/platform/file.hpp"
 #include "basalt/platform/memory.hpp"
 #include "basalt/platform/process.hpp"
 #include "basalt/platform/system.hpp"
+#include "basalt/program/community_row.hpp"
+#include "basalt/program/host_rates.hpp"
 #include "basalt/program/engine_session.hpp"
+#include "basalt/program/gpu_select.hpp"
 
 #include <errno.h>
 
@@ -42,6 +46,7 @@
 #endif
 #if __has_include("basalt_git.h")
 #include "basalt_git.h"
+#include "basalt/log.hpp"
 #endif
 #ifndef BASALT_BENCH_GIT
 #define BASALT_BENCH_GIT "unknown"
@@ -79,22 +84,7 @@ std::string fmt(const char* f, ...) {
 
 double secs(Clock::time_point a, Clock::time_point b) { return std::chrono::duration<double>(b - a).count(); }
 
-std::string json_quote(const std::string& s) {
-    std::string o = "\"";
-    for (unsigned char c : s) {
-        switch (c) {
-            case '"': o += "\\\""; break;
-            case '\\': o += "\\\\"; break;
-            case '\n': o += "\\n"; break;
-            case '\t': o += "\\t"; break;
-            case '\r': o += "\\r"; break;
-            default:
-                if (c < 0x20) o += fmt("\\u%04x", (unsigned) c);
-                else o += (char) c;
-        }
-    }
-    return o + "\"";
-}
+using basalt::program::json_quote;
 
 // Streaming JSON writer: commas and key/value pairing are tracked here.
 class JW {
@@ -136,6 +126,8 @@ public:
         double power_enforced_w = -1;   // the limit the driver applies now (the management limit when it cannot say)
         double vram_gib = -1;
         int sm_mhz = -1, mem_mhz = -1;
+        int pcie_gen = -1, pcie_width = -1;   // the link's maximum generation and its current width: the generation drops at idle, the width does not, and the
+                                          // maximum width is the card's, not the slot's
     };
 
     bool open() {
@@ -154,6 +146,8 @@ public:
         enf_ = lib_.sym<int (*)(void*, unsigned*)>("nvmlDeviceGetEnforcedPowerLimit");
         mem_ = lib_.sym<int (*)(void*, MemInfo*)>("nvmlDeviceGetMemoryInfo");
         bus_ = lib_.sym<int (*)(const char*, void**)>("nvmlDeviceGetHandleByPciBusId_v2");
+        maxgen_ = lib_.sym<int (*)(void*, unsigned*)>("nvmlDeviceGetMaxPcieLinkGeneration");
+        maxwid_ = lib_.sym<int (*)(void*, unsigned*)>("nvmlDeviceGetCurrPcieLinkWidth");
         if (!init_ || !count_ || !handle_ || init_() != 0) return false;
         unsigned n = 0;
         if (count_(&n) != 0) return false;
@@ -207,6 +201,8 @@ private:
         unsigned c = 0;
         if (clk_ && clk_(h, 1, &c) == 0) s.sm_mhz = (int) c;    // NVML_CLOCK_SM
         if (clk_ && clk_(h, 2, &c) == 0) s.mem_mhz = (int) c;   // NVML_CLOCK_MEM
+        if (maxgen_ && maxgen_(h, &c) == 0) s.pcie_gen = (int) c;
+        if (maxwid_ && maxwid_(h, &c) == 0) s.pcie_width = (int) c;
         return s;
     }
     basalt::platform::DynLib lib_;
@@ -215,6 +211,8 @@ private:
     int (*enf_)(void*, unsigned*) = nullptr;
     int (*mem_)(void*, MemInfo*) = nullptr;
     int (*bus_)(const char*, void**) = nullptr;
+    int (*maxgen_)(void*, unsigned*) = nullptr;
+    int (*maxwid_)(void*, unsigned*) = nullptr;
     int (*init_)() = nullptr;
     int (*shut_)() = nullptr;
     int (*drv_)(char*, unsigned) = nullptr;
@@ -234,13 +232,15 @@ struct Options {
     std::vector<std::pair<std::string, std::string>> sets;
     std::vector<std::string> passthrough;
     std::string spec;                    // --spec N: the engine argument of the same name
+    std::string gpu;                     // --gpu: the cards (gpu_select.hpp); one after -- wins
     std::vector<std::string> decode;     // -t: conv, struct, prose
     std::vector<long long> depths;       // -p: prefill depths in tokens
     bool sel_decode = false, sel_prefill = false;
     int reps = 1;
     bool quality = false, no_windows = false, print_command = false;
-    bool community = false;
-    std::string submitter = "YOUR_GITHUB_HANDLE";
+    bool community = false, hardware = false;
+    std::string submitter;
+    std::string community_file;          // --community-file: the table the row is added to
     int quality_chunks = 20, quality_t = 3;
     unsigned long long seed = 0;         // --seed N: the sampling seed of every decode request (0: the engine seeds from the clock)
 };
@@ -271,15 +271,22 @@ void usage(const std::string& engine) {
         "                     fixtures, a 16384-token prefill and a 65536-token prefill, once each, with int8 KV cache\n"
         "                     and the engine's own defaults otherwise (no warm-up, no repetition, drafting at its\n"
         "                     default). The decode fixtures and each prefill run in their own fresh engine process, so\n"
-        "                     every number is cold. Prints the table, then one JSON row. prefill_16k_tps and\n"
-        "                     prefill_64k_tps = engine tokens/s of those requests; decode_tps = tokens / decode time\n"
+        "                     every number is cold. Prints the table, adds the row to benchmarks.json and prints it. prefill_16k_tps and\n"
+        "                     prefill_64k_tps = engine tokens/s of those requests; the row also records the CPU, the RAM read speed and, per GPU, the\n"
+        "                     PCIe link (maximum generation and width) and the pinned host-to-device copy speed, measured before the engine starts; decode_tps = tokens / decode time\n"
         "                     summed over conv, struct and prose (token-weighted). Needs NVML for the GPU names, VRAM and enforced power limits. Only\n"
-        "                     --model, --submitter, --fixtures, --logs and --print-command may be given with it:\n"
+        "                     --model, --submitter, --community-file, --fixtures, --logs and --print-command may be given with it:\n"
         "                     any other option or engine flag would make rows incomparable and is refused\n"
-        "  --submitter NAME   the GitHub handle written into the row (default: the placeholder to replace)\n"
+        "  --submitter NAME   the name shown in the table, written into the row (required with --community)\n"
+        "  --community-file PATH  the benchmarks.json the row is added to (default: docs/community/benchmarks.json of the\n"
+        "                     checkout this build came from); when it cannot be written the row is printed instead\n"
+        "\n"
+        "  --hardware         measure and print this machine's CPU, RAM read speed and, per GPU, PCIe link and\n"
+        "                     host-to-device copy speed (the figures --community records), then exit; no model, no engine\n"
         "\n"
         "engine\n"
-        "  --model FILE       a .basalt model file; --peer-device 1 is added when a second GPU is visible. Every\n"
+        "  --model FILE       a .basalt model file\n"
+        "  --gpu A,B,..|auto  the GPUs, as for the server and the engine (default: GPU 0 alone). Every\n"
         "                     other --flag is an engine flag, passed on as given (same names as `basalt`; the engine\n"
         "                     rejects a bad one at startup); --print-command shows the command and exits\n"
         "  --engine BIN       engine binary (default: the one built with this program)\n"
@@ -327,18 +334,6 @@ void usage(const std::string& engine) {
     }
 }
 
-// The GPUs this process can see: CUDA_VISIBLE_DEVICES when set, else what NVML lists.
-size_t visible_gpus() {
-    if (const char* v = std::getenv("CUDA_VISIBLE_DEVICES")) {
-        size_t n = 0;
-        for (const auto& d : split(v, ','))
-            if (d != "-1") ++n;
-        return n;
-    }
-    Nvml nvml;
-    return nvml.open() ? nvml.count() : 0;
-}
-
 bool parse_args(int argc, char** argv, Options& o, std::string& err) {
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
@@ -358,7 +353,10 @@ bool parse_args(int argc, char** argv, Options& o, std::string& err) {
         else if (a == "--engine") o.engine = next("--engine");
         else if (a == "--spec") o.spec = next("--spec");
         else if (a == "--community") o.community = true;
+        else if (a == "--gpu") o.gpu = next("--gpu");
+        else if (a == "--hardware") o.hardware = true;
         else if (a == "--submitter") o.submitter = next("--submitter");
+        else if (a == "--community-file") o.community_file = next("--community-file");
         else if (a == "--fixtures") o.fixtures = next("--fixtures");
         else if (a == "-o") o.format = next("-o");
         else if (a == "--power-label") o.power_label = next("--power-label");
@@ -407,14 +405,21 @@ bool parse_args(int argc, char** argv, Options& o, std::string& err) {
     if (o.community) {
         const char* bad = o.sel_decode || o.sel_prefill ? "-t / -p" : o.reps != 1 ? "-r" : o.quality ? "--quality"
                         : !o.spec.empty() ? "--spec" : !o.sets.empty() ? "--set" : !o.engine.empty() ? "--engine"
-                        : !o.power_label.empty() ? "--power-label" : o.seed ? "--seed" : o.no_windows ? "--no-windows"
+                        : !o.gpu.empty() ? "--gpu" : !o.power_label.empty() ? "--power-label" : o.seed ? "--seed" : o.no_windows ? "--no-windows"
                         : o.format != "md" ? "-o" : !o.passthrough.empty() ? o.passthrough[0].c_str() : nullptr;
         if (bad != nullptr) {
             err = std::string("--community runs the fixed preset: ") + bad + " would make the row incomparable";
             return false;
         }
         if (o.model.empty()) { err = "--community needs --model FILE"; return false; }
+        std::string who = o.submitter;
+        for (char& c : who) c = (char) std::toupper((unsigned char) c);
+        if (who.find_first_not_of(" \t") == std::string::npos || who == "YOUR_NAME") {
+            err = "--community needs --submitter NAME, the name shown in the table";
+            return false;
+        }
     }
+    if (!o.community_file.empty() && !o.community) { err = "--community-file needs --community"; return false; }
     if (o.reps < 1) { err = "-r needs N >= 1"; return false; }
     if (o.format != "md" && o.format != "json") { err = "-o takes md or json"; return false; }
     if (o.quality_chunks < 1 || o.quality_t < 1) { err = "--quality and --quality-t need values >= 1"; return false; }
@@ -423,7 +428,7 @@ bool parse_args(int argc, char** argv, Options& o, std::string& err) {
             err = "-t: unknown fixture " + s + " (conv, struct, prose)";
             return false;
         }
-    if (o.model.empty() && o.passthrough.empty()) {
+    if (o.model.empty() && o.passthrough.empty() && !o.hardware) {
         err = "give --model FILE or engine arguments after --";
         return false;
     }
@@ -609,6 +614,55 @@ bool read_kld_base(const std::string& path, uint32_t& n_ctx, int32_t& n_vocab, i
     return true;
 }
 
+// ---------------------------------------------------------------------------------------------- hardware
+
+// The host figures a community row records, measured while no engine runs.
+struct Hardware {
+    std::string cpu;
+    double ram_gbps = 0;
+    std::vector<std::pair<std::string, double>> h2d;   // PCI bus id as the runtime spells it, GB/s
+};
+
+Hardware measure_hardware() {
+    Hardware h;
+    const basalt::platform::CpuInfo c = basalt::platform::cpu_info();
+    h.cpu = basalt::program::cpu_label(c.name, c.physical_cores);
+    h.ram_gbps = basalt::program::measure_ram_read_gbps();
+    const std::string dev = BASALT_BENCH_DEVICE;
+    if (!dev.empty() && fs::exists(dev))
+        if (const auto out = basalt::platform::capture_output({dev, "--link-rates"}, false)) h.h2d = basalt::program::parse_link_rates(*out);
+    return h;
+}
+
+double h2d_of(const Hardware& h, const std::string& bus_id) {
+    const std::string k = basalt::program::normalize_bus_id(bus_id);
+    for (const auto& x : h.h2d)
+        if (basalt::program::normalize_bus_id(x.first) == k) return x.second;
+    return 0;
+}
+
+std::string pcie_text(const Nvml::Snap& s) { return s.pcie_gen > 0 && s.pcie_width > 0 ? fmt("%d.0 x%d", s.pcie_gen, s.pcie_width) : ""; }
+
+std::string short_card(std::string n) {
+    for (const char* v : {"NVIDIA ", "GeForce "})
+        if (n.rfind(v, 0) == 0) n.erase(0, std::strlen(v));
+    return n;
+}
+
+// "hardware" block: one line each for the CPU, the RAM and every GPU in `cards` (bus id, snapshot, h2d).
+std::string hardware_text(const Hardware& h, const std::vector<std::pair<std::string, Nvml::Snap>>& cards) {
+    std::string t = "hardware (measured before the engine starts)\n";
+    t += "  CPU   " + (h.cpu.empty() ? std::string("unknown") : h.cpu) + "\n";
+    t += h.ram_gbps > 0 ? fmt("  RAM   read %.1f GB/s\n", h.ram_gbps) : std::string("  RAM   read speed not measured\n");
+    for (const auto& c : cards) {
+        const double g = h2d_of(h, c.first);
+        const std::string link = pcie_text(c.second);
+        t += "  GPU   " + short_card(c.second.name) + "  PCIe " + (link.empty() ? std::string("unknown") : link) +
+             (g > 0 ? fmt("  host-to-device %.1f GB/s", g) : std::string("  host-to-device not measured")) + "\n";
+    }
+    return t;
+}
+
 // ---------------------------------------------------------------------------------------------- main
 
 }  // namespace
@@ -617,11 +671,25 @@ int main(int argc, char** argv) {
     Options o;
     std::string err;
     if (!parse_args(argc, argv, o, err)) {
-        std::fprintf(stderr, "basalt-bench: %s\n", err.c_str());
+        basalt::log::error("basalt-bench", "%s", err.c_str());
         return 2;
     }
     basalt::platform::ignore_broken_pipe();   // a closed pipe surfaces as a failed write
     basalt::platform::install_child_stop_signals();
+
+    if (o.hardware) {
+        Nvml nvml;
+        if (!nvml.open()) basalt::log::warn("basalt-bench", "NVML is unavailable: PCIe links are NOT recorded");
+        const Hardware hw = measure_hardware();
+        std::vector<std::pair<std::string, Nvml::Snap>> cards;
+        for (const auto& x : hw.h2d) {
+            Nvml::Snap sn;
+            nvml.snap_bus(x.first, sn);
+            cards.emplace_back(x.first, sn);
+        }
+        std::fputs(hardware_text(hw, cards).c_str(), stdout);
+        return 0;
+    }
 
     if (o.community) o.no_windows = true;   // the draft log is analysis, not part of the preset
 
@@ -638,7 +706,7 @@ int main(int argc, char** argv) {
     const bool do_prefill = !o.depths.empty();
     const bool do_perf = do_decode || do_prefill;
     if (do_quality && o.kld_base.empty()) {
-        std::fprintf(stderr, "basalt-bench: the quality gate needs --kld-base FILE\n");
+        basalt::log::error("basalt-bench", "the quality gate needs --kld-base FILE");
         return 2;
     }
 
@@ -647,15 +715,11 @@ int main(int argc, char** argv) {
     std::vector<std::string> args;
     if (!o.model.empty()) {
         args = {"--model", fs::absolute(o.model).string()};
-        // A second GPU can hold an expert tier only where a process is given GPU-to-GPU access between its
-        // devices; the engine refuses --peer-device without it, so the bench does not offer one.
-        if (basalt::platform::gpu_peer_access() && !has_arg(args, "--peer-device") && visible_gpus() > 1)
-            set_arg(args, "--peer-device", "1");
     }
     if (engine_bin.empty()) engine_bin = BASALT_BENCH_ENGINE;
     if (o.engine.empty() && std::string(BASALT_BENCH_ENGINE).size() > 0 && fs::exists(BASALT_BENCH_ENGINE)) engine_bin = BASALT_BENCH_ENGINE;
     if (engine_bin.empty() || !fs::exists(engine_bin)) {
-        std::fprintf(stderr, "basalt-bench: the engine binary %s does not exist (--engine BIN)\n", engine_bin.c_str());
+        basalt::log::error("basalt-bench", "the engine binary %s does not exist (--engine BIN)", engine_bin.c_str());
         return 2;
     }
     for (const auto& kv : o.sets) set_arg(args, kv.first, kv.second);
@@ -663,6 +727,18 @@ int main(int argc, char** argv) {
     if (o.model.empty()) for (const auto& a : o.passthrough) args.push_back(a);
     else merge_args(args, o.passthrough);
     if (!o.community && !has_arg(args, "--spec")) set_arg(args, "--spec", "0");
+    // the GPUs, chosen here once as the server chooses them: the engine sees only those cards and says nothing again
+    if (!o.model.empty()) {
+        std::string gpu_value, gerr;
+        std::vector<basalt::program::GpuCard> used;
+        // a community run uses every visible card; CUDA_VISIBLE_DEVICES picks them
+        const std::string want = o.community ? "auto" : has_arg(args, "--gpu") ? arg_value(args, "--gpu") : o.gpu;
+        if (!basalt::program::select_gpus(want, "basalt-bench", gpu_value, used, gerr)) {
+            basalt::log::error("basalt-bench", "%s", gerr.c_str());
+            return 2;
+        }
+        set_arg(args, "--gpu", gpu_value);
+    }
 
     // fixtures, read before anything is started
     std::vector<std::vector<int64_t>> decode_ids(3);
@@ -672,14 +748,14 @@ int main(int argc, char** argv) {
             if (!wants(kDecode[i].name)) continue;
             std::vector<std::vector<int64_t>> lines;
             if (!read_id_lines((fs::path(o.fixtures) / kDecode[i].file).string(), lines, err) || lines.empty()) {
-                std::fprintf(stderr, "basalt-bench: %s\n", err.empty() ? (std::string(kDecode[i].file) + " is empty").c_str() : err.c_str());
+                basalt::log::error("basalt-bench", "%s", err.empty() ? (std::string(kDecode[i].file) + " is empty").c_str() : err.c_str());
                 return 2;
             }
             for (auto& l : lines) decode_ids[i].insert(decode_ids[i].end(), l.begin(), l.end());
         }
     if (do_prefill) {
         if (!read_id_lines((fs::path(o.fixtures) / "prefill.ids").string(), prefill_parts, err) || prefill_parts.size() != 3) {
-            std::fprintf(stderr, "basalt-bench: %s\n", err.empty() ? "prefill.ids needs three lines (before, body, after)" : err.c_str());
+            basalt::log::error("basalt-bench", "%s", err.empty() ? "prefill.ids needs three lines (before, body, after)" : err.c_str());
             return 2;
         }
     }
@@ -714,7 +790,7 @@ int main(int argc, char** argv) {
     }
     std::error_code ec;
     fs::create_directories(work, ec);
-    if (ec) { std::fprintf(stderr, "basalt-bench: cannot create %s\n", work.c_str()); return 2; }
+    if (ec) { basalt::log::error("basalt-bench", "cannot create %s", work.c_str()); return 2; }
     struct Cleanup {
         std::string dir;
         bool on;
@@ -728,18 +804,25 @@ int main(int argc, char** argv) {
 
     Nvml nvml;
     const bool have_nvml = nvml.open();
-    if (!have_nvml) std::fprintf(stderr, "basalt-bench: NVML is unavailable: power limits and clocks are NOT recorded\n");
+    if (!have_nvml) basalt::log::warn("basalt-bench", "NVML is unavailable: power limits and clocks are NOT recorded");
     if (o.community && (!have_nvml || nvml.count() == 0)) {
-        std::fprintf(stderr, "basalt-bench: --community needs NVML (the NVIDIA driver's management library) to read the GPU names, "
-                             "VRAM and enforced power limits for the row; it could not be loaded\n");
+        basalt::log::error("basalt-bench", "--community needs NVML (the NVIDIA driver's management library) to read the GPU names, "
+                             "VRAM and enforced power limits for the row; it could not be loaded");
         return 1;
     }
     if (o.community && std::string(BASALT_BENCH_GIT).find_first_not_of("0123456789abcdef") != std::string::npos) {
-        std::fprintf(stderr, "basalt-bench: --community needs a build from a git checkout: the row records the commit\n");
+        basalt::log::error("basalt-bench", "--community needs a build from a git checkout: the row records the commit");
         return 1;
     }
     if (o.community && BASALT_BENCH_DIRTY)
-        std::fprintf(stderr, "basalt-bench: WARNING: tracked files differ from commit %s; the row names that commit\n", BASALT_BENCH_GIT);
+        basalt::log::warn("basalt-bench", "tracked files differ from commit %s; the row names that commit", BASALT_BENCH_GIT);
+    Hardware hw;
+    if (o.community) {
+        hw = measure_hardware();
+        if (hw.cpu.empty()) basalt::log::warn("basalt-bench", "the CPU could not be read; the row has no cpu");
+        if (hw.ram_gbps <= 0) basalt::log::warn("basalt-bench", "the RAM read speed could not be measured (needs 3 GiB free); the row has no ram_gbps");
+        if (hw.h2d.empty()) basalt::log::warn("basalt-bench", "the host-to-device copy speed could not be measured; the rows' gpus have no h2d_gbps");
+    }
     std::vector<Nvml::Snap> gpus_start;
     for (size_t i = 0; i < nvml.count(); ++i) gpus_start.push_back(nvml.snap(i));
 
@@ -779,9 +862,9 @@ int main(int argc, char** argv) {
         const Session& sess = sessions[si];
         const std::string log_path = (fs::path(work) / (si == 0 ? "engine.log" : fmt("engine-%zu.log", si))).string();
         Engine eng;
-        std::fprintf(stderr, "basalt-bench: starting %s (log: %s)\n", engine_bin.c_str(), log_path.c_str());
+        basalt::log::info("basalt-bench", "starting %s (log: %s)", engine_bin.c_str(), log_path.c_str());
         if (!eng.start(engine_bin, perf_args, log_path, err)) {
-            std::fprintf(stderr, "basalt-bench: %s\n", err.c_str());
+            basalt::log::error("basalt-bench", "%s", err.c_str());
             return 1;
         }
         if (o.community) {
@@ -791,12 +874,11 @@ int main(int argc, char** argv) {
             if (spill != 0.0) {
                 eng.stop();
                 if (spill < 0)
-                    std::fprintf(stderr, "basalt-bench: the engine did not report where the experts live; cannot check for SSD spill\n");
+                    basalt::log::warn("basalt-bench", "the engine did not report where the experts live; cannot check for SSD spill");
                 else
-                    std::fprintf(stderr,
-                                 "basalt-bench: this run would read %.1f GiB of experts from the SSD. Community runs need every "
+                    basalt::log::error("basalt-bench", "this run would read %.1f GiB of experts from the SSD. Community runs need every "
                                  "expert in VRAM, the peer GPU or RAM: free roughly %.0f GiB more RAM (close other programs) "
-                                 "and run again. No row was written.\n", spill, std::ceil(spill));
+                                 "and run again. No row was written.", spill, std::ceil(spill));
                 return 1;
             }
         }
@@ -814,7 +896,7 @@ int main(int argc, char** argv) {
                 r.name = kDecode[i].name;
                 r.run = run;
                 if (!eng.request(sampling_keys(kDecode[i].temperature, o.seed), kDecode[i].max_new, decode_ids[i], r.d)) {
-                    std::fprintf(stderr, "basalt-bench: %s (run %d): %s\n", r.name.c_str(), run, r.d.err.c_str());
+                    basalt::log::error("basalt-bench", "%s (run %d): %s", r.name.c_str(), run, r.d.err.c_str());
                     failed = true;
                     break;
                 }
@@ -824,7 +906,7 @@ int main(int argc, char** argv) {
                 r.checksum_bad = r.name == "struct" && r.d.generated != kStructTokens;
                 ++n_requests;
                 ++n_decode_requests;
-                std::fprintf(stderr, "  run %d %-7s %.1f tok/s, %lld tokens\n", run, r.name.c_str(), tok_s(r.d), r.d.generated);
+                basalt::log::raw("  run %d %-7s %.1f tok/s, %lld tokens\n", run, r.name.c_str(), tok_s(r.d), r.d.generated);
                 results.push_back(std::move(r));
             }
             for (size_t pi = 0; pi < sess.depths.size() && !failed; ++pi) {
@@ -844,7 +926,7 @@ int main(int argc, char** argv) {
                 r.run = run;
                 r.depth = depth;
                 if (!eng.request(" top_p=0.95 top_k=20", depth == kPrefillBase ? kPrefillBaseDecode : 1, ids, r.d)) {
-                    std::fprintf(stderr, "basalt-bench: pp%lld (run %d): %s\n", depth, run, r.d.err.c_str());
+                    basalt::log::error("basalt-bench", "pp%lld (run %d): %s", depth, run, r.d.err.c_str());
                     failed = true;
                     break;
                 }
@@ -852,7 +934,7 @@ int main(int argc, char** argv) {
                 r.sm_mhz = s.sm_mhz;
                 r.mem_mhz = s.mem_mhz;
                 ++n_requests;
-                std::fprintf(stderr, "  run %d pp%lld %lld tokens, %.0f t/s engine, %.0f t/s wall\n", run, depth, r.d.prompt,
+                basalt::log::raw("  run %d pp%lld %lld tokens, %.0f t/s engine, %.0f t/s wall\n", run, depth, r.d.prompt,
                              prefill_engine_ts(r.d), prefill_wall_ts(r.d));
                 results.push_back(std::move(r));
             }
@@ -862,7 +944,7 @@ int main(int argc, char** argv) {
         eng.stop();
         for (size_t i = 0; i < gpus_end.size() && i < gpus_start.size(); ++i)
             if (gpus_end[i].power_limit_w != gpus_start[i].power_limit_w)
-                std::fprintf(stderr, "basalt-bench: WARNING: the power limit of GPU %zu changed during the run (%.0f W -> %.0f W)\n", i,
+                basalt::log::warn("basalt-bench", "the power limit of GPU %zu changed during the run (%.0f W -> %.0f W)", i,
                              gpus_start[i].power_limit_w, gpus_end[i].power_limit_w);
         }
         if (failed) return 1;
@@ -877,7 +959,7 @@ int main(int argc, char** argv) {
                 for (size_t i = 0; i < results.size(); ++i)
                     if (results[i].name != "prefill") order.push_back(i);
             } else {
-                std::fprintf(stderr, "basalt-bench: the draft log has %zu request blocks for %d requests: window statistics skipped\n",
+                basalt::log::warn("basalt-bench", "the draft log has %zu request blocks for %d requests: window statistics skipped",
                              blocks.size(), n_requests);
             }
             for (size_t k = 0; k < order.size(); ++k) results[order[k]].win = window_stats(blocks[k]);
@@ -892,7 +974,7 @@ int main(int argc, char** argv) {
         quality.t = o.quality_t;
         quality.n_chunks_asked = o.quality_chunks;
         if (!read_kld_base(o.kld_base, n_ctx, n_vocab, n_chunk, chunks, o.quality_chunks, quality.err)) {
-            std::fprintf(stderr, "basalt-bench: %s\n", quality.err.c_str());
+            basalt::log::error("basalt-bench", "%s", quality.err.c_str());
         } else {
             std::vector<std::string> qa = args;
             set_arg(qa, "--spec", "5");
@@ -907,9 +989,9 @@ int main(int argc, char** argv) {
             for (const auto& a : qa) quality.args += (quality.args.empty() ? "" : " ") + a;
             Engine eng;
             const auto t0 = Clock::now();
-            std::fprintf(stderr, "basalt-bench: starting the engine for the quality gate\n");
+            basalt::log::info("basalt-bench", "starting the engine for the quality gate");
             if (!eng.start(engine_bin, qa, (fs::path(work) / "engine-quality.log").string(), quality.err)) {
-                std::fprintf(stderr, "basalt-bench: %s\n", quality.err.c_str());
+                basalt::log::error("basalt-bench", "%s", quality.err.c_str());
             } else {
                 quality.load_s = secs(t0, Clock::now());
                 const auto t1 = Clock::now();
@@ -927,7 +1009,7 @@ int main(int argc, char** argv) {
                     }
                     pp_ms += d.prompt_ms;
                     dec_ms += d.decode_ms;
-                    if ((k + 1) % 10 == 0) std::fprintf(stderr, "  quality %zu/%zu chunks, %.0f s\n", k + 1, chunks.size(), secs(t1, Clock::now()));
+                    if ((k + 1) % 10 == 0) basalt::log::raw("  quality %zu/%zu chunks, %.0f s\n", k + 1, chunks.size(), secs(t1, Clock::now()));
                 }
                 quality.run_s = secs(t1, Clock::now());
                 eng.stop();
@@ -944,19 +1026,25 @@ int main(int argc, char** argv) {
     // ---- report
     const std::string model = arg_value(args, "--model");
 
-    // the power limit of the primary GPU: as set now, or the label the caller gave
+    // the power limit of the primary GPU (the first card the engine reports, by PCI bus id): as set now, or the label the caller gave
+    std::string primary_bus;
+    if (info.count("gpus")) primary_bus = info["gpus"].substr(0, info["gpus"].find(','));
+    Nvml::Snap primary;
+    const bool have_primary = !primary_bus.empty() && nvml.snap_bus(primary_bus, primary);
     std::string power = "unknown";
     if (!o.power_label.empty()) {
         power = o.power_label;
         if (all_digits(power)) power += " W";
-    } else if (!gpus_start.empty() && gpus_start[0].power_limit_w > 0) {
+    } else if (have_primary && primary.power_limit_w > 0) {
+        power = fmt("%.0f W", primary.power_limit_w);
+    } else if (primary_bus.empty() && !gpus_start.empty() && gpus_start[0].power_limit_w > 0) {
         power = fmt("%.0f W", gpus_start[0].power_limit_w);
     } else if (const auto smi = basalt::platform::capture_output(
-                   {"nvidia-smi", "-i", "0", "--query-gpu=power.limit", "--format=csv,noheader,nounits"}, false);
+                   {"nvidia-smi", "-i", primary_bus.empty() ? "0" : primary_bus, "--query-gpu=power.limit", "--format=csv,noheader,nounits"}, false);
                smi && std::atof(smi->c_str()) > 0) {
         power = fmt("%.0f W", std::atof(smi->c_str()));
     }
-    if (power == "unknown") std::fprintf(stderr, "basalt-bench: WARNING: the power limit could not be read; pass --power-label W\n");
+    if (power == "unknown") basalt::log::warn("basalt-bench", "the power limit could not be read; pass --power-label W");
 
     // one table row per test: values over the repetitions
     struct Row {
@@ -1037,6 +1125,7 @@ int main(int argc, char** argv) {
                 rep += fmt("\nnote: struct produced %lld tokens, the expected count is %lld\n", x.d.generated, kStructTokens);
     }
     std::string community_row;
+    basalt::program::CommunityRow crow;
     if (o.community) {
         // one aggregate per direction over the single cold pass: tokens over time summed across requests
         double pre_tps[2] = {0, 0}, pre_s[2] = {0, 0}, dec_tok = 0, dec_ms = 0;
@@ -1050,8 +1139,8 @@ int main(int argc, char** argv) {
                 dec_ms += x.d.decode_ms;
             }
         }
-        std::vector<std::string> gpu_json;
         std::string gpu_err;
+        std::vector<std::pair<std::string, Nvml::Snap>> cards;
         std::istringstream ids(info.count("gpus") ? info["gpus"] : "");
         for (std::string id; std::getline(ids, id, ',');) {
             Nvml::Snap g;
@@ -1059,32 +1148,36 @@ int main(int argc, char** argv) {
                 gpu_err = "NVML could not read the GPU at " + id;
                 break;
             }
-            for (const char* v : {"NVIDIA ", "GeForce "})
-                if (g.name.rfind(v, 0) == 0) g.name.erase(0, std::strlen(v));
-            gpu_json.push_back(fmt("{\"name\": %s, \"vram_gib\": %.0f, \"power_w\": %.0f}", json_quote(g.name).c_str(),
-                                   g.vram_gib, g.power_enforced_w));
+            g.name = short_card(g.name);
+            crow.gpus.push_back({g.name, g.vram_gib, g.power_enforced_w, pcie_text(g), h2d_of(hw, id)});
+            cards.emplace_back(id, g);
         }
         const uint64_t ram_b = basalt::platform::total_physical_memory();
-        if (gpu_err.empty() && gpu_json.empty()) gpu_err = "the engine did not report which GPUs it used";
+        if (gpu_err.empty() && crow.gpus.empty()) gpu_err = "the engine did not report which GPUs it used";
         if (gpu_err.empty() && (pre_tps[0] <= 0 || pre_tps[1] <= 0 || dec_ms <= 0)) gpu_err = "a request reported no time";
         if (gpu_err.empty() && ram_b == 0) gpu_err = "the system RAM size could not be read";
         if (!gpu_err.empty()) {
-            std::fprintf(stderr, "basalt-bench: cannot write the community row: %s\n", gpu_err.c_str());
+            basalt::log::error("basalt-bench", "cannot write the community row: %s", gpu_err.c_str());
             std::fputs(rep.c_str(), stdout);
             return 1;
         }
         std::time_t now = std::time(nullptr);
         char day[16] = {};
         std::strftime(day, sizeof day, "%Y-%m-%d", std::localtime(&now));
-        std::string gj;
-        for (const std::string& g : gpu_json) gj += (gj.empty() ? "" : ", ") + g;
-        community_row = fmt("{\"submitter\": %s, \"date\": \"%s\", \"commit\": \"%s\", \"preset\": \"community-1\", "
-                            "\"gpus\": [%s], \"ram_gib\": %.0f, \"os\": \"%s\", \"quant\": %s, "
-                            "\"prefill_16k_tps\": %.1f, \"prefill_64k_tps\": %.1f, \"decode_tps\": %.1f, \"link\": \"\"}",
-                            json_quote(o.submitter).c_str(), day, BASALT_BENCH_GIT, gj.c_str(),
-                            (double) ram_b / (double) (1ull << 30), basalt::platform::host_os_name().c_str(),
-                            json_quote(info.count("quant") ? info["quant"] : "unknown").c_str(),
-                            pre_tps[0], pre_tps[1], dec_tok / (dec_ms / 1000.0));
+        crow.submitter = o.submitter;
+        crow.date = day;
+        crow.commit = BASALT_BENCH_GIT;
+        crow.preset = "community-1";
+        crow.ram_gib = (double) ram_b / (double) (1ull << 30);
+        crow.cpu = hw.cpu;
+        crow.ram_gbps = hw.ram_gbps;
+        crow.os = basalt::platform::host_os_name();
+        crow.quant = info.count("quant") ? info["quant"] : "unknown";
+        crow.prefill_16k_tps = pre_tps[0];
+        crow.prefill_64k_tps = pre_tps[1];
+        crow.decode_tps = dec_tok / (dec_ms / 1000.0);
+        community_row = basalt::program::community_row_text(crow);
+        rep += "\n" + hardware_text(hw, cards);
         rep += fmt("\ncommunity-1: prefill 16K %.1f t/s (%.1f s), prefill 64K %.1f t/s (%.1f s), decode %.1f t/s (%.0f tokens in %.1f s), "
                    "each measured cold\n",
                    pre_tps[0], pre_s[0], pre_tps[1], pre_s[1], dec_tok / (dec_ms / 1000.0), dec_tok, dec_ms / 1000.0);
@@ -1221,9 +1314,18 @@ int main(int argc, char** argv) {
     }
     std::fputs(rep.c_str(), stdout);
     if (!community_row.empty()) {
-        std::printf("\nCOMMUNITY ROW (one line; set submitter to your GitHub handle):\n%s\n"
-                    "Submit it: add the row to the runs list in docs/community/benchmarks.json and open a pull request (docs/community.md).\n",
-                    community_row.c_str());
+        const std::string path = o.community_file.empty() ? std::string(BASALT_BENCH_SOURCE_DIR) + "/docs/community/benchmarks.json"
+                                                          : o.community_file;
+        std::string why;
+        std::printf("\nCOMMUNITY ROW:\n%s\n", community_row.c_str());
+        std::fflush(stdout);
+        if (basalt::program::community_add_row_file(path, crow, why))
+            basalt::log::info("basalt-bench", "the row was added to %s; review it, commit it and open a pull request (docs/community.md)",
+                              path.c_str());
+        else
+            basalt::log::warn("basalt-bench", "the row was not added to %s (%s); paste it at the end of the runs list of docs/community/benchmarks.json, "
+                              "run python3 tools/check_benchmarks.py --fix on it and open a pull request (docs/community.md)",
+                              path.c_str(), why.c_str());
     }
     return do_quality && !quality.ran ? 1 : 0;
 }

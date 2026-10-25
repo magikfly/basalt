@@ -42,6 +42,7 @@
 #include <vector>
 
 namespace basalt::kernels::cpu { class ExpertPool; }
+namespace basalt::kernels { struct DmMixLayer; }
 
 namespace basalt::core {
 
@@ -119,6 +120,9 @@ public:
     /// The peer expert tier the window drives itself (persistent kernel, mapped rings) instead of the pool launching it
     /// per layer.  Before init.
     void set_peer(PeerExperts* peer) { peer_ = peer; }
+    /// A further peer card's expert tier, served like the first by a persistent kernel of its own (its own ring,
+    /// doorbell and done word); only with the device-planned MoE tail.  Before init, after set_peer.
+    void add_peer(PeerExperts* peer) { xpeers_.push_back(peer); }
     /// The CPU pool and the expert source the window's CPU tier runs on: between doorbells the parked workers predict
     /// the next layer's CPU experts (its router on this layer's FFN input) and read the likeliest into their caches.
     /// Before init; only with the device-planned MoE tail.
@@ -164,7 +168,8 @@ public:
     bool set_logit_bias(const std::vector<float>& bias, std::string& err);
     /// Draws row `t` of the window just run again, with `bias` (one float per vocabulary entry, -inf bans) in place of
     /// the request's logit_bias; the penalties, the filters and the position's draw are the window's own. `pos0` is the
-    /// window's first position. The token is in `token`; the window's other rows are untouched.
+    /// window's first position; a batch window's row ignores it and draws with its own slot's sampling and position.
+    /// The token is in `token`; the window's other rows are untouched.
     bool resample_row(int t, int64_t pos0, const std::vector<float>& bias, int32_t& token, std::string& err);
 
     /// The penalty histories for `sampling_.penalty_last_n`: ONE ROW PER WINDOW ROW, T rows of `history_len` int32
@@ -205,6 +210,19 @@ public:
     /// The 8-bit copies of every layer's hyper-connection matrices (and the head's) on the current device; called
     /// before the expert cache takes the free memory.
     static void prepare_hc8(const WeightTable& wt, const ModelGeometry& g);
+    /// The CUDA0 bytes the GDN mixer split by key head loads after the expert cache is sized (CUDA0's packed rows and
+    /// columns of its key heads), for CUDA0 on dev0 and the peer on dev1; 0 when the split is not taken.
+    static int64_t gs_cuda0_bytes(const WeightTable& wt, const ModelGeometry& g, int dev0, int dev1);
+    /// The peer bytes the split loads after the peer's expert tier is filled (its key heads' rows, columns, gates,
+    /// state slices and the mixer's rows); 0 when the split is not taken.
+    static int64_t gs_peer_bytes(const WeightTable& wt, const ModelGeometry& g, int dev0, int dev1);
+    /// Prices the GDN mixer split at start and keeps it only when its modelled decode saving beats its cost: the
+    /// `displaced` expert bytes its peer reserve pushes off the peer.  Windows of up to max_t tokens.  Call before
+    /// gs_cuda0_bytes / gs_peer_bytes; true when the split is taken.
+    static bool gs_decide(const WeightTable& wt, const ModelGeometry& g, int dev0, int dev1, int max_t, int64_t displaced);
+    /// The peer bytes the head split by vocabulary loads after the peer's expert tier is filled, for a head of
+    /// `row_bytes` per row and native `type`, windows of up to max_t tokens; 0 when the split is not taken.
+    static int64_t hs_peer_bytes(size_t row_bytes, int type, int64_t n_vocab, int64_t n_embd, int max_t, int dev0, int dev1);
     /// The bytes prepare_hc8 will place when `has` names the tensors the model holds (0 with the copies off).
     static uint64_t hc8_plan_bytes(const std::function<bool(const std::string&)>& has, const ModelGeometry& g);
 
@@ -218,6 +236,14 @@ public:
     /// Work queued on `s` after this call starts only once the window stream has run everything queued on it so far (the
     /// residency uploads of dm_presync), so a large copy on `s` cannot hold the small uploads back in the copy queue.
     bool dm_fence(cudaStream_t s);
+    /// The adaptive tier's landed words (DmGlueArgs::landed): device, one per layer, null without the device-planned
+    /// tail.  A round's copies into the slots write the round's number into a layer's word once that layer's are in.
+    unsigned int* landed_words() const;
+    /// Every window's gate/up launch waits for its layer's word (each window size captured, each layer's routed experts
+    /// through dec_moe_glue): a round's incoming experts may be resident before their copies are done.
+    bool landed_ok() const;
+    /// The windows from the next on wait for `round`'s copies (queued on the window stream).
+    bool landed_need(uint32_t round, std::string& err);
     /// `f` runs on the calling thread of the next `run`, right after the window's graph is launched.
     void set_post_launch(std::function<void()> f) { post_launch_ = std::move(f); }
     /// runs it now if no window has since (a request ending)
@@ -297,6 +323,30 @@ public:
     /// Captures every solo window width's graph and the commit for session `s` now.
     bool warm_session(SessionState* s, std::string& err);
 
+    // ---- PIPELINED WINDOWS (a layer split of two stages with two chains of verifiers over the same sessions, A and B).
+    // Window A runs; once its stage 0 is done, stage 0 commits A as if every row were kept (the state it reaches when the
+    // guess below holds) and starts window B, whose first token is the guess for A's next token, while stage 1 still runs
+    // A.  A held (every row accepted, and A's last pick is B's first token): stage 1 commits A and runs B (`pair_hold`).
+    // A missed: B's stage 0 drains and stage 0's state is put back as before that commit (`pair_miss`); the caller then
+    // commits A with its real count as for any window.  The head of each chain calls these.
+    /// Before init, on a chain's first stage: the verifier keeps a snapshot of its state in `snap` (`pair_snapshot_bytes`).
+    void set_pipelined(void* snap) { pair_snap_ = snap; }
+    /// The next window's graph on this verifier waits for `e` (then it forgets it): work on the same card it must not
+    /// overlap, such as the drafter's chain.
+    void set_wait_event(cudaEvent_t e) { wait_ev_ = e; }
+    static uint64_t pair_snapshot_bytes(const ModelGeometry& g, const SessionState& ss, int64_t lb, int64_t le);
+    /// `guess` runs once this window's stage 0 has served its last ring: it writes the next window's tokens to `tokb` and
+    /// returns their count, or 0 for no guess (then this is `run`).  `tb` gets that count.
+    bool run_pair(Verifier& b, int ta, const int32_t* toka, int64_t pa, const std::function<int(int32_t*)>& guess,
+                  int32_t* tokb, int& tb, PoolMultiFn pool, void* usera, void* userb, int32_t* outa, std::string& err);
+    bool pair_hold_commit(int ta, std::string& err);
+    bool pair_hold_begin(Verifier& b, int ta, int64_t pa, int tb, const int32_t* tokb, std::string& err);
+    /// The next window's first stage, served to its end (the card is then free for the drafter), and its last stage.
+    bool pair_hold_finish_first(Verifier& b, PoolMultiFn pool, void* userb, std::string& err);
+    bool pair_hold_finish(Verifier& b, PoolMultiFn pool, void* userb, int32_t* outb, std::string& err);
+    bool pair_miss(Verifier& b, PoolMultiFn pool, void* userb, std::string& err);
+
+    Verifier* next_stage() const { return next_; }
     /// Token t's residual after the last layer, (hc, n_embd) on the device, valid until the next `run`.
     const float* final_R(int t) const;
     const float* final_R_all() const { return next_ ? next_->final_R_all() : R_; }
@@ -315,16 +365,55 @@ private:
     RemoteExpertOpt* remote_opt_ = nullptr;
     bool main_high_ = false;
     PeerExperts* peer_ = nullptr;
+    std::vector<PeerExperts*> xpeers_;
     basalt::kernels::cpu::ExpertPool* warm_pool_ = nullptr;
     ExpertSource* warm_src_ = nullptr;
     DecMoe* dm_ = nullptr;   // the device-planned MoE tail (null: off)
     bool dm_init(std::string& err);
+    // the head split by vocabulary with the peer card, when the peer streams its rows faster than CUDA0 does
+    void hs_init();
+    void hs_free();
+    // the GDN mixer split by key head with the peer card, when the peer streams the mixer's bytes faster than CUDA0
+    void gs_init();
+    void gs_free();
+    // the peer's heads of every GDN layer between CUDA0's full state and gs_state_: to the peer before the first split
+    // window, back before anything reads the whole state (wait_commit, a batch window); between windows only
+    bool gs_move(bool to_peer, std::string& err);
     bool dm_sync(std::string& err);        ///< the residency tables to the devices, before a window
     bool dm_begin(std::string& err, DecodeGaps* gm);   ///< the tail's window start (tables, flags, the peer window)
+    bool dm_stage_places(std::string& err);            ///< the staged share's RAM addresses, read again when they moved
     bool dm_end(std::string& err);         ///< the peer window's end
     void dm_free();
     std::string peer_released();           ///< after a release: whether the peer window ended (see dm_note)
     bool capture(int T, std::string& err);
+    // run(), in three parts: the launch, the host's serving of the rings, the finish
+    bool run_begin(int T, const int32_t* tokens, int64_t pos0, std::string& err, cudaEvent_t after = nullptr);
+    bool run_serve(PoolMultiFn pool, void* user, std::string& err);
+    bool run_end(int32_t* out, std::string& err);
+    /// One step of the host's service of the window's rings: 1 = every ring served, 0 = the GPU has not reached the next
+    /// one, -1 = an error.
+    int serve_poll(PoolMultiFn pool, void* user, std::string& err);
+    struct WindowFlight {
+        int T = 0;
+        int64_t pos0 = 0;
+        bool do_ple = false, ple_early = false, sampled = false, biased = false, early_sample = false, probe = false;
+        std::vector<uint32_t> ple_rows;
+        int64_t k = 0;                      ///< the next ring to serve
+        bool waiting = false;               ///< the wait for ring k has started
+        uint32_t spins = 0;
+        std::chrono::steady_clock::time_point wait_t0, last_flush;
+    } fl_;
+    // the pair's snapshot and optimistic commit
+    void* pair_snap_ = nullptr;
+    cudaEvent_t wait_ev_ = nullptr;
+    cudaEvent_t ev_opt_ = nullptr;         ///< recorded behind an optimistic commit
+    int64_t snap_pos0_ = 0;
+    int32_t snap_ple_[2] = {-1, -1};
+    bool pl_save(std::string& err);
+    bool pl_qsa_copy(bool save, std::string& err);
+    static constexpr int kPairRows = 4;     ///< indexer pooled rows a commit of one window can complete
+    bool pl_restore(std::string& err);
+    bool pl_commit_opt(int n_keep, std::string& err);
     bool pdl_rec_ = false;   // record_window may use programmatic dependent launch
     bool pdl_off_ = false;                 ///< ... a window failed to capture with it: the later ones go without
     // batch windows (see init_slots)
@@ -435,6 +524,8 @@ private:
     cudaStream_t cs_ = nullptr;
     cudaStream_t sh_cs_ = nullptr;
     cudaStream_t sh_hi_ = nullptr;   // the shared expert's side stream at the greatest priority
+    cudaStream_t sh_hi2_ = nullptr;  // its up projection's, beside the gate projection
+    cudaEvent_t ev_sh2_ = nullptr;
     cudaEvent_t ev_fork_ = nullptr, ev_join_ = nullptr;
     cudaStream_t qs_[3] = {nullptr, nullptr, nullptr};   // a QSA layer's branches
     cudaEvent_t qev_[5] = {nullptr, nullptr, nullptr, nullptr, nullptr};
@@ -469,6 +560,7 @@ private:
     uint32_t* h_flagB_ = nullptr; uint32_t* m_flagB_ = nullptr;  // the PCIe share's DMA copies have landed
     std::function<void()> post_launch_;
     cudaEvent_t fence_ev_ = nullptr;      // dm_fence
+    bool landed_glue_ = true;             // every device-planned layer captured so far ran dec_moe_glue
     cudaEvent_t commit_done_ = nullptr;   // recorded after an async commit (set_commit_async); see wait_commit
     bool commit_pending_ = false;
     // The async commit's own stream, after an event on cs_.  The next window's first node (the finisher) takes what the
@@ -479,10 +571,23 @@ private:
     uint32_t* h_pend_ = nullptr; uint32_t* m_pend_ = nullptr;   // the epoch the commit's begin kernel last started
     uint32_t commit_epoch_ = 0;
     int fin_blocks_ = 0;
+    // Lazy GDN layers (lazy_on): the commit graph and the finisher take only the first GDN layer; the later ones are
+    // committed inside the next solo window, on lz_s_ from the previous layer's FFN read (that layer's own items and,
+    // until the previous layer's combine has its CPU rows, later ones), joined before the layer's GDN kernels.  The
+    // same launches (and one before each QSA layer) read the next layer's projection weights into L2 while the
+    // previous layer's combine waits for the CPU pool.
+    cudaStream_t lz_s_ = nullptr;
+    cudaEvent_t lz_fork_ = nullptr, lz_join_ = nullptr;
+    bool lz_pending_ = false;                       ///< a commit whose lazy layers no window has applied yet
     bool finisher_on() const;                        ///< solo windows start with the finisher
+    bool lazy_on() const;                            ///< the GDN layers after the first are committed lazily
     bool commit_begun() const;                       ///< the begin kernel of the last async commit has run
-    void order_after_commit();                       ///< a launch on cs_ outside the solo windows follows the async commit
+    /// a launch on cs_ outside the solo windows follows the async commit (and its lazy layers, unless `solo`)
+    void order_after_commit(bool solo = false);
+    void apply_lazy();                               ///< the pending lazy layers on cm_, before commit_done_
     basalt::kernels::GdnCommitLayers commit_gdn_args() const;
+    basalt::kernels::GdnCommitLayers commit_gdn_layer(int64_t gdn_index) const;   ///< one GDN layer's commit
+    basalt::kernels::GdnCommitLayers commit_gdn_lazy_args() const;              ///< the lazy layers' commit
     static void raise_flag_b(void* ctx);
     static void raise_flag(uint32_t* flag, uint32_t value);
     int32_t* h_plan_ = nullptr;  int32_t* m_plan_ = nullptr;     // counts | start | dst | tok | ptr (as int32 pairs)
@@ -517,6 +622,44 @@ private:
     float* hit_xs_ = nullptr;
     void* hit_scratch_ = nullptr;
     float *head_mixed_ = nullptr, *head_inj_ = nullptr, *head_logits_ = nullptr;
+    // head split: CUDA0 computes rows [0, hs_rows_), the peer the rest; hs_rows_ 0 means no split
+    int hs_rows_ = 0, hs_dev_ = -1;
+    void* hs_w_ = nullptr;           // peer: head rows [hs_rows_, n_vocab_)
+    void* hs_xq_ = nullptr;          // peer: the head's q8_1 input
+    float* hs_y_ = nullptr;          // peer: its logits, T rows of n_vocab_ - hs_rows_
+    float* hs_y0_ = nullptr;         // CUDA0: its logits, T rows of hs_rows_
+    void* hs_hxq_ = nullptr;         // pinned staging of the input
+    float* hs_hy_ = nullptr;         // pinned staging of the peer's logits
+    cudaStream_t hs_s_ = nullptr;    // peer
+    cudaEvent_t hs_in_ = nullptr;    // CUDA0: the input is staged
+    cudaEvent_t hs_out_ = nullptr;   // peer: its logits are staged
+    // GDN mixer split by key head: CUDA0 owns key heads [0, gs_nk0_), the peer the rest; gs_nk0_ 0 means no split
+    struct GsLayer {   // peer: one GDN layer's weights for its heads (gdn_head_split.hpp layout)
+        void *wqkv = nullptr, *wz = nullptr, *wo = nullptr;
+        void *wqkv0 = nullptr, *wz0 = nullptr, *wo0 = nullptr;   // CUDA0: its heads' packed qkv/z rows, out columns
+        float *conv_w = nullptr, *dt = nullptr, *ssm_a = nullptr, *gamma = nullptr;
+        uint16_t *wa = nullptr, *wb = nullptr;
+        int tq = -1, tz = -1, to = -1;
+    };
+    int gs_nk0_ = 0, gs_dev_ = -1;
+    std::vector<GsLayer> gs_layers_;   // by GDN layer index
+    float* gs_state_ = nullptr;        // peer: its heads' recurrent state and conv history, per GDN layer
+    // the mixer doorbell (DmPeerArgs::mix): mapped q8_1 rows per ring; peer: which rings have one, the rows' copy
+    uint8_t *gs_h_xq_ = nullptr, *gs_m_xq_ = nullptr;
+    uint8_t* gs_mix_ = nullptr;
+    void* gs_pxq_ = nullptr;
+    // mapped: the fp32 rows per ring and the peer's out-projection partial; peer: the layer table and its scratch;
+    // CUDA0: its heads' packed qkv / z
+    float *gs_h_x_ = nullptr, *gs_m_x_ = nullptr, *gs_h_part_ = nullptr, *gs_m_part_ = nullptr;
+    basalt::kernels::DmMixLayer* gs_mixl_ = nullptr;
+    float* gs_pscr_ = nullptr;
+    float *gs_qkv0_ = nullptr, *gs_z0_ = nullptr;
+    // the peer's commit of its heads (the window's rows in gs_pscr_); live: gs_state_ holds the truth of its heads for
+    // session gs_ss_ (CUDA0's copies of them are stale); split: the last window ran split
+    basalt::kernels::GdnCommitLayers gs_ca_;
+    bool gs_live_ = false, gs_split_ = false;
+    SessionState* gs_ss_ = nullptr;
+    float *gs_h_full_ = nullptr, *gs_h_slice_ = nullptr;   // pinned staging for gs_move: CUDA0's whole layers, the slice
     uint8_t* vhead_scratch_ = nullptr;   // the two-stage head's histogram and row list (q6k_vhead)
     float *sh_gate_ = nullptr, *sh_up_ = nullptr, *sh_g_ = nullptr;
     float* hist_snap_ = nullptr;                              // T * NG_HIST * NG_HC_DIM

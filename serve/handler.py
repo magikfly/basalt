@@ -21,6 +21,7 @@ from serve.api.logit_bias import REQUEST_KEY as BIAS_KEY, checked as checked_bia
 from serve.frontend import anthropic_to_messages, forced_call, openai_to_messages
 from serve.api.openai import openai_chunks, openai_collect
 from serve.api.responses import ResponsesError
+from serve.prompt import primed
 from serve.security import host_allowed, host_names_for, key_matches, origin_allowed
 from serve.service import LOG_FIRST_LINES, LOG_MAX_LINES, Service, _debug_req
 from serve.api.structured import anthropic_format, check_format
@@ -59,7 +60,7 @@ def make_handler(svc: Service):
             host = self.headers.get("Host")
             if svc.api_key or host_allowed(host, svc.host_names, "*" in svc.allowed_hosts):
                 return True
-            print(f"[server] refused Host {host!r} from {self.client_address[0]} "
+            print(f"[server] error: refused Host {host!r} from {self.client_address[0]} "
                   f"(--api-key KEY, or --allowed-host)",
                   flush=True)
             self._json(403, {"error": {"type": "forbidden", "message":
@@ -131,7 +132,7 @@ def make_handler(svc: Service):
                 return False
             if not origin_allowed(origin, self.headers.get("Host"), svc.host_names,
                                   [*svc.trusted_origins, *svc.cors_origins]):
-                print(f"[server] refused a request from web page {origin!r} "
+                print(f"[server] error: refused a request from web page {origin!r} "
                       f"(--api-key KEY, --allowed-host, --cors-origin)", flush=True)
                 self._json(403, {"error": {"type": "forbidden", "message":
                                  f"web pages of {origin} may not use this server without an API key; start the server with --api-key KEY, "
@@ -526,7 +527,7 @@ def make_handler(svc: Service):
             _debug_req("openai", req, messages, tools, max_new, thinking, len(ids))
             cancel = threading.Event()
             self._watch_client(cancel)
-            chunks = openai_chunks(svc, req, ids, thinking, tools, max_new, cancel, force=force)
+            chunks = primed(openai_chunks(svc, req, ids, thinking, tools, max_new, cancel, force=force), ids)
             if not req.get("stream"):
                 return self._json(200, openai_collect(chunks))
             self._sse()
@@ -573,7 +574,11 @@ def make_handler(svc: Service):
                         done = x
                 if done is not None and done["finish"] != "cancel" and not cancel.is_set():
                     yield from asm.finish(done)
-            items = events()
+            try:
+                items = primed(events(), ids)
+            except ValueError as e:                          # too long for the context: found when the engine counted
+                err = ResponsesError(str(e), "input", "context_length_exceeded" if "context" in str(e) else None)
+                return self._json(err.status, err.body())
             if not req.get("stream"):
                 try:
                     result = responses_api.collect(items)
@@ -693,7 +698,7 @@ def make_handler(svc: Service):
             _debug_req("anthropic", req, messages, tools, max_new, thinking, len(ids))
             cancel = threading.Event()
             self._watch_client(cancel)
-            events = anthropic_events(svc, req, ids, thinking, tools, max_new, cancel, force=force)
+            events = primed(anthropic_events(svc, req, ids, thinking, tools, max_new, cancel, force=force), ids)
             if not req.get("stream"):
                 return self._json(200, anthropic_collect(events))
             self._sse()

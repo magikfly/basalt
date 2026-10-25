@@ -39,10 +39,10 @@ struct GdnCommitLayers {
 /// From `blocks` persistent blocks (grid-stride); each loads its next item while the current one runs.
 void gdn_commit_layers(const GdnCommitLayers& a, void* stream, int blocks = 32);
 /// Counters of the commit's dynamic items, two sets used by epoch parity (claim, done, started, pre; one line each),
-/// then the newest epoch and the last epoch a finisher finished.  Zeroed once; a set is reset by the begin kernel of the
-/// epoch that uses it.
+/// then the newest epoch, the last epoch a finisher finished and the lazy layers' claims.  Zeroed once (then
+/// gdn_commit_lazy_none); a set and the lazy claims are reset by the begin kernel of the epoch that uses them.
 struct CommitCtl {
-    uint32_t w[32 * 10];
+    uint32_t w[32 * 11];
 };
 /// The commit epoch's start: reads the epoch (> 0) from `epoch` (a device alias of mapped memory), resets that epoch's
 /// counter set, publishes `started` and writes the epoch to `begun` (a device alias of mapped memory the host polls).
@@ -54,6 +54,24 @@ void gdn_commit_layers_dyn(const GdnCommitLayers& a, CommitCtl* ctl, void* strea
 /// checks `begun` before launching the window) the blocks claim the epoch's remaining items, then wait until all are
 /// done and `pre` is published, and the epoch is marked finished; otherwise every block returns.
 void gdn_commit_finish(const GdnCommitLayers& a, CommitCtl* ctl, void* stream, int blocks);
+/// The newest epoch's commit of the layers in `a` (as gdn_commit_layers), its items claimed in order from the epoch's
+/// lazy counter: every item of the first `must_layers` not claimed yet, then further ones while *stop != stop_value
+/// (device word; null: none).  A launch after the epoch's earlier ones finds their items done.
+/// `pf` (or null): what the launch also reads into L2 for the next layer while the layer it runs beside waits for the
+/// CPU pool: once *stop holds stop_value with its top bit (the combine waits) and while it still does, if the layer has
+/// entries off CUDA0 at all (ids against ptab, that layer's CUDA0 blob table).
+constexpr int kLazyPfRanges = 8;
+struct GdnLazyPf {
+    const void* p[kLazyPfRanges] = {};   ///< byte ranges (16-byte multiples) in the order they are used; empty ones last
+    uint64_t n[kLazyPfRanges] = {};
+    const int32_t* ids = nullptr;
+    int n_ids = 0, n_expert = 0;
+    const unsigned long long* ptab = nullptr;
+};
+void gdn_commit_lazy(const GdnCommitLayers& a, CommitCtl* ctl, int must_layers, const uint32_t* stop,
+                     uint32_t stop_value, void* stream, int blocks, const GdnLazyPf* pf = nullptr);
+/// The lazy counter of a new CommitCtl: nothing owed until the first begin kernel.
+bool gdn_commit_lazy_none(CommitCtl* ctl);
 /// A window of several sequences ("segments"): each segment is n consecutive rows with its own GDN state.  The table
 /// has one entry per window row (a segment's rows all carry the segment's fields), uploaded to the device per window.
 /// A kernel launched over the entries lets only the segment's first row (j == 0) do the segment's work.
@@ -103,6 +121,21 @@ void gdn_step_norm_multi(float* state, const float* h, int conv_channels, const 
 /// Spin until *flag >= value (a mapped host flag).  The value is fixed at capture, so several rings can be
 /// outstanding at once (the split verify window keeps two).
 void wait_flag_ge(const uint32_t* flag, uint32_t value, void* stream);
+/// Sets *flag = value (a mapped host flag) behind everything queued on the stream, written out to the system first: the
+/// other end of a wait_flag_ge on another device.
+void signal_flag(uint32_t* flag, uint32_t value, void* stream);
+/// Up to kWordCopyMax disjoint device word ranges copied by one launch (the pipelined pair's state snapshot).
+constexpr int kWordCopyMax = 32;
+struct WordCopy {
+    const int32_t* src = nullptr;
+    int32_t* dst = nullptr;
+    int n = 0;
+};
+struct WordCopyList {
+    WordCopy e[kWordCopyMax];
+    int n = 0;
+};
+void word_copy_list(const WordCopyList& l, void* stream);
 /// the GPU's %globaltimer (ns) into buf[i] (a one-thread kernel: the verify window's stage profiler).
 void gpu_stamp(unsigned long long* buf, int i, void* stream);
 

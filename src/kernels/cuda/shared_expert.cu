@@ -38,6 +38,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <stdexcept>
+#include "basalt/log.hpp"
 
 namespace basalt::kernels {
 namespace {
@@ -124,6 +125,26 @@ void shared_expert_multi(int n_tok, const float* x, const NativeSharedWeights& n
     if (e != cudaSuccess) throw std::runtime_error(std::string("shared_expert_multi: ") + cudaGetErrorString(e));
 }
 
+void shared_expert_multi_rows(int n_tok, const NativeSharedWeights& nw, float* gate, float* up, float* out,
+                              int64_t n_embd, int64_t n_ff, void* stream, void* stream2, void* join) {
+    if (n_tok < 1 || n_tok > 8 || !nw.q8_1 || !nw.gate_data || !nw.up_data || !nw.down_data || !stream ||
+        (stream2 != nullptr && join == nullptr))
+        throw std::invalid_argument("shared_expert_multi_rows: needs 1..8 tokens, native weights, rows and a stream");
+    cudaStream_t cs = (cudaStream_t) stream;
+    native_mmvq(nw.gate_type, nw.gate_data, nw.q8_1, gate, (int) n_embd, (int) n_ff, n_tok, stream);
+    if (stream2 != nullptr) {
+        native_mmvq(nw.up_type, nw.up_data, nw.q8_1, up, (int) n_embd, (int) n_ff, n_tok, stream2);
+        cudaEventRecord((cudaEvent_t) join, (cudaStream_t) stream2);
+        cudaStreamWaitEvent(cs, (cudaEvent_t) join, 0);
+    } else {
+        native_mmvq(nw.up_type, nw.up_data, nw.q8_1, up, (int) n_embd, (int) n_ff, n_tok, stream);
+    }
+    native_swiglu_quantize_q8_1(gate, up, nw.q8_1, (int) n_ff, n_tok, stream);
+    native_mmvq(nw.down_type, nw.down_data, nw.q8_1, out, (int) n_ff, (int) n_embd, n_tok, stream);
+    const cudaError_t e = cudaGetLastError();
+    if (e != cudaSuccess) throw std::runtime_error(std::string("shared_expert_multi_rows: ") + cudaGetErrorString(e));
+}
+
 uint64_t shared_expert_scratch_bytes(int64_t n_ff) {
     // gate (n_ff f32) | up (n_ff f32) | q8_0 (n_ff/32*34) | q8k (n_ff/256*292) | g (1 f32), 16-byte aligned
     const uint64_t a = ((uint64_t) n_ff * 4 + 15) & ~15ull;
@@ -154,8 +175,8 @@ void shared_expert(const uint8_t* x_q8_0, const uint8_t* x_q8k, const SForm& gat
         if (native_down) native_mmvq_weight_bytes(native->down_type, (int) n_ff, (int) n_embd);
     }
     if (scratch == nullptr) {
-        std::fprintf(stderr, "shared_expert: scratch is null; the caller owns it "
-                             "(see shared_expert_scratch_bytes)\n");
+        basalt::log::error("basalt", "shared_expert: scratch is null; the caller owns it "
+                             "(see shared_expert_scratch_bytes)");
         std::exit(1);
     }
     // CARVED FROM THE CALLER'S SCRATCH: allocation is illegal during stream capture and the token path
@@ -213,8 +234,8 @@ void shared_expert(const uint8_t* x_q8_0, const uint8_t* x_q8k, const SForm& gat
             native_mmvq(native->down_type, native->down_data, native->q8_1, out, (int) n_ff, (int) n_embd, 1, stream);
         } else if (down_form.act_kind == 1) {
             if (n_ff % 256 != 0) {
-                std::fprintf(stderr, "shared_expert: the down weight wants Q8_K but n_ff %lld is not a multiple "
-                                     "of 256; Q8_K is structurally impossible here\n", (long long) n_ff);
+                basalt::log::error("basalt", "shared_expert: the down weight wants Q8_K but n_ff %lld is not a multiple "
+                                     "of 256; Q8_K is structurally impossible here", (long long) n_ff);
                 std::exit(1);
             }
             quantize_q8_K(gate, h_q8k, n_ff, stream);
@@ -236,7 +257,7 @@ void shared_expert(const uint8_t* x_q8_0, const uint8_t* x_q8k, const SForm& gat
     if (stream == nullptr) {
         const cudaError_t e = cudaDeviceSynchronize();
         if (e != cudaSuccess) {
-            std::fprintf(stderr, "shared_expert: %s\n", cudaGetErrorString(e));
+            basalt::log::error("basalt", "shared_expert: %s", cudaGetErrorString(e));
             std::exit(1);
         }
     }
@@ -248,7 +269,7 @@ void moe_combine(const float* parts, const float* weights, const float* shared, 
     // k > 64 is refused rather than truncated: silently summing the first 64 of a longer list would be a
     // wrong answer that looks like a right one, and no geometry in this artifact comes close to it.
     if (k > 64) {
-        std::fprintf(stderr, "moe_combine: k = %lld exceeds 64\n", (long long) k);
+        basalt::log::error("basalt", "moe_combine: k = %lld exceeds 64", (long long) k);
         std::exit(1);
     }
     const unsigned grid = (unsigned) ((n_embd + THREADS - 1) / THREADS);
@@ -257,7 +278,7 @@ void moe_combine(const float* parts, const float* weights, const float* shared, 
     if (stream == nullptr) {
         const cudaError_t e = cudaDeviceSynchronize();
         if (e != cudaSuccess) {
-            std::fprintf(stderr, "moe_combine: %s\n", cudaGetErrorString(e));
+            basalt::log::error("basalt", "moe_combine: %s", cudaGetErrorString(e));
             std::exit(1);
         }
     }

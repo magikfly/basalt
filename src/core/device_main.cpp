@@ -9,6 +9,7 @@
 #include <cstdio>
 #include <cstring>
 #include <string>
+#include "basalt/log.hpp"
 
 static std::string human(uint64_t b) {
     char buf[64];
@@ -20,18 +21,30 @@ static std::string human(uint64_t b) {
 int main(int argc, char** argv) {
     bool selftest = false;
     bool list_devices = false;
+    bool link_rates = false;
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--selftest") == 0) selftest = true;
         else if (std::strcmp(argv[i], "--list-devices") == 0) list_devices = true;
+        else if (std::strcmp(argv[i], "--link-rates") == 0) link_rates = true;
         else if (std::strcmp(argv[i], "--help") == 0 || std::strcmp(argv[i], "-h") == 0) {
-            std::printf("usage: basalt-device [--selftest] [--list-devices]\n"
+            std::printf("usage: basalt-device [--selftest] [--list-devices] [--link-rates]\n"
                         "  --list-devices  every GPU the runtime enumerates, numbered as\n"
-                        "                  CUDA_VISIBLE_DEVICES numbers them, and whether this binary can run it\n");
+                        "                  CUDA_VISIBLE_DEVICES numbers them, and whether this binary can run it\n"
+                        "  --link-rates    per GPU, one line \"pcie_h2d BUS_ID GB_PER_S\": pinned host-to-device copy speed\n");
             return 0;
         } else {
-            std::fprintf(stderr, "unknown argument: %s\n", argv[i]);
+            basalt::log::error("basalt", "unknown argument: %s", argv[i]);
             return 2;
         }
+    }
+
+    if (link_rates) {
+        for (int ordinal = 0; ordinal < basalt::core::device_count(); ++ordinal) {
+            std::string bus;
+            const double gbps = basalt::core::device_h2d_gbps(ordinal);
+            if (basalt::core::device_pci_bus_id(ordinal, bus) && gbps > 0) std::printf("pcie_h2d %s %.1f\n", bus.c_str(), gbps);
+        }
+        return 0;
     }
 
     // Every card the runtime enumerates, without the arch check `device_info` applies.  Format:
@@ -76,7 +89,7 @@ int main(int argc, char** argv) {
             void* a = arena.alloc(1 << 20, 256);
             void* b = arena.alloc(1 << 20, 4096);
             if (((uintptr_t) a % 256) || ((uintptr_t) b % 4096)) {
-                std::fprintf(stderr, "selftest: alignment not honoured\n");
+                basalt::log::error("basalt", "selftest: alignment not honoured");
                 return 1;
             }
             std::printf("\nselftest: arena %s, used %s after two 1 MiB allocations\n", human(arena.capacity()).c_str(),
@@ -84,7 +97,7 @@ int main(int argc, char** argv) {
             // and the arena must REFUSE rather than wrap
             try {
                 arena.alloc(bytes * 2);
-                std::fprintf(stderr, "selftest: over-allocation did NOT throw\n");
+                basalt::log::error("basalt", "selftest: over-allocation did NOT throw");
                 return 1;
             } catch (const basalt::core::CudaError&) {
                 std::printf("selftest: over-allocation refused as required\n");
@@ -93,7 +106,7 @@ int main(int argc, char** argv) {
         }
         return 0;
     } catch (const std::exception& e) {
-        std::fprintf(stderr, "basalt-device: %s\n", e.what());
+        basalt::log::error("basalt-device", "%s", e.what());
         return 1;
     }
 }

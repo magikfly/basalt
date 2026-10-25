@@ -75,6 +75,9 @@ public:
     /// request lends only the slots its prompt needs.  The stream must be idle (between prompts).
     bool relayout(int64_t chunk, void* borrow, uint64_t borrow_bytes, std::string& err);
     int64_t chunk() const;
+    /// The next runs read their first chunk with at most `tokens` tokens (0: every chunk is `chunk()` long), so the
+    /// rows it waits for before layer 1 are few; the chunks after it are `chunk()` long.
+    void set_head_chunk(int64_t tokens) { head_chunk_ = tokens; }
     /// Points the prompt path at another session's state (a view of `ss` with a batch slot's state fields) for the
     /// next runs; the buffers and the layer range stay.
     void set_session(core::SessionState& ss);
@@ -126,12 +129,15 @@ public:
     bool route_hist_take(std::vector<uint32_t>& out, int64_t& tokens);
 
     /// multi-GPU: the experts the peer GPU holds are computed THERE for every prompt chunk (up to `cap_rows` routed
-    /// rows per layer; the rest of the peer's experts are read by this GPU over P2P).  Allocates the peer's buffers for
-    /// chunks of up to init's `chunk` tokens.  Without P2P: the routed-only chunks, and the streamed ones up to a fixed
-    /// size on the FP4 experts (the same bits as this GPU's), with the rows crossing through host memory.
-    bool set_peer(core::PeerExperts* peer, int64_t cap_rows, std::string& err);
-    /// --peer-exclusive: experts only `peer` holds have no host copy; the prompt path reads them from its memory
-    /// over P2P (into the ring, or in place).  Independent of set_peer.
+    /// rows per layer).  Allocates the peer's buffers for chunks of up to init's `chunk` tokens: the routed-only
+    /// chunks, and the streamed ones up to a fixed size on the FP4 experts (the same bits as this GPU's), with the rows
+    /// crossing through host memory.
+    bool set_peer(core::PeerExperts* peer, int64_t cap_rows, bool streamed_share, std::string& err);
+    /// The bytes `set_peer` takes on the peer card for chunks of up to `chunk` tokens (0: no peer share); the peer tier
+    /// leaves them free when it sizes itself.
+    static uint64_t peer_bytes(int64_t chunk, bool streamed_share);
+    /// --peer-exclusive: experts only `peer` holds have no host copy; the prompt path copies them from its memory
+    /// through host staging into the ring.  Independent of set_peer.
     void set_ring_peer(core::PeerExperts* peer);
 
     /// The CPU expert pool (idle while a prompt is read). A chunk below stream_all_min() tokens hands it the
@@ -184,6 +190,7 @@ private:
 
     kernels::cpu::ExpertPool* cpu_pool_ = nullptr;
     int64_t stage_lb_ = 0, stage_le_ = -1;
+    int64_t head_chunk_ = 0;
     Prefill* next_ = nullptr;
     bool single_chunk_ = false;         ///< a later stage: the prompt is one chunk (set by the stage before)
     const float* hand_in_ = nullptr;    ///< the previous stage's rows of the chunk being read (host, pinned)

@@ -12,6 +12,7 @@
 #include <cstdio>
 #include <cstring>
 #include <exception>
+#include "basalt/log.hpp"
 
 namespace basalt::core {
 
@@ -186,7 +187,7 @@ bool NativeEmbed::load(const std::vector<std::string>& shards, int64_t n_embd, i
                 err = "native embedding: cannot pin " + std::to_string(bytes_ >> 20) + " MiB, nor place it in VRAM";
                 return false;
             }
-            std::fprintf(stderr, "basalt: native embedding: cannot pin %llu MiB, kept in VRAM instead\n",
+            basalt::log::warn("basalt", "native embedding: cannot pin %llu MiB, kept in VRAM instead",
                          (unsigned long long) (bytes_ >> 20));
             dev_ = d;
         } else {
@@ -202,6 +203,7 @@ bool NativeEmbed::load(const std::vector<std::string>& shards, int64_t n_embd, i
             if (cudaMalloc(&hot_, (size_t) n_hot * row_) == cudaSuccess &&
                 cudaMemcpy(hot_, host_, (size_t) n_hot * row_, cudaMemcpyHostToDevice) == cudaSuccess) {
                 n_hot_ = n_hot;
+                cudaGetDevice(&hot_device_);
             } else {
                 if (hot_) cudaFree(hot_);
                 hot_ = nullptr;
@@ -219,11 +221,17 @@ bool NativeEmbed::load(const std::vector<std::string>& shards, int64_t n_embd, i
 }
 
 void NativeEmbed::gather_dev(const int32_t* tokens, int64_t n_tok, float* out, void* stream) const {
-    basalt::kernels::iq_embed_rows(type_, dev_, row_, tokens, n_tok, n_embd_, out, stream, hot_, n_hot_);
+    int dev = 0;
+    cudaGetDevice(&dev);
+    const bool hot = dev == hot_device_;
+    basalt::kernels::iq_embed_rows(type_, dev_, row_, tokens, n_tok, n_embd_, out, stream, hot ? hot_ : nullptr,
+                                   hot ? n_hot_ : 0);
 }
 
 void NativeEmbed::gather_one(int64_t token, float* out, void* stream) const {
-    const uint8_t* table = (const uint8_t*) (token < n_hot_ ? hot_ : dev_);
+    int dev = 0;
+    cudaGetDevice(&dev);
+    const uint8_t* table = (const uint8_t*) (token < n_hot_ && dev == hot_device_ ? hot_ : dev_);
     basalt::kernels::iq_dequant_f32(type_, table + (size_t) token * row_, n_embd_, out, stream);
 }
 

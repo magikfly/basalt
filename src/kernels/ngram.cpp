@@ -2,6 +2,7 @@
 //
 // See include/basalt/kernels/ngram.hpp for the semantics, the rival readings, and the note on MADV_RANDOM.
 #include "basalt/kernels/ngram.hpp"
+#include "basalt/core/load_progress.hpp"
 #include "basalt/artifact/gguf_reader.hpp"
 #include "basalt/artifact/dequant.hpp"
 #include "basalt/kernels/f16_bits.hpp"
@@ -17,6 +18,7 @@
 #include <mutex>
 #include <vector>
 #include <stdexcept>
+#include "basalt/log.hpp"
 
 
 namespace basalt::kernels {
@@ -229,15 +231,23 @@ bool PleTable::open(const std::string& gguf_path, std::string& err, const PleIoO
         const uintptr_t a1 = (uintptr_t) impl_->data + (uintptr_t) need;
         // The pages are asked for ahead and locked; where the OS refuses, touching them gets them resident, which is
         // what the decode path needs.
-        const basalt::platform::LockResult lr = basalt::platform::lock_view((void*) a0, a1 - a0);
+        // The bytes placed go out as the engine's load lines, under their own target (outside the model total).
+        basalt::core::LoadProgress prog("ngram", a1 - a0);
+        uint64_t reported = 0;
+        const basalt::platform::LockResult lr = basalt::platform::lock_view(
+            (void*) a0, a1 - a0, [&](uint64_t done) { prog.add(done - reported); reported = done; });
         impl_->locked = lr.ok && lr.locked_bytes >= a1 - a0;
         if (!impl_->locked) {
-            std::fprintf(stderr, "basalt: PLE table lock incomplete (%s): touching its pages instead\n",
+            basalt::log::warn("basalt", "PLE table lock incomplete (%s): touching its pages instead",
                          lr.note.c_str());
             volatile uint8_t sink = 0;
-            for (uintptr_t p = a0; p < a1; p += page) sink = sink + *(const volatile uint8_t*) p;
+            for (uintptr_t p = a0 + (uintptr_t) reported; p < a1; p += page) {
+                sink = sink + *(const volatile uint8_t*) p;
+                if (((p - a0) & ((256u << 20) - 1)) == 0) { prog.add((p - a0) - reported); reported = p - a0; }
+            }
             (void) sink;
         }
+        prog.finish();
     }
     impl_->mode = io.mode;
     return true;
@@ -415,6 +425,7 @@ bool PleTable::gather_batch(const uint32_t* rows, size_t n_tokens, float* out, s
 }
 
 void PleTable::set_injected_delay_us(double us) { impl_->reader.set_injected_delay_us(us); }
+void PleTable::rearm_keepalive() { impl_->reader.rearm_keepalive(); }
 
 std::string PleTable::io_report() const {
     if (impl_->mode != PleIo::Direct || !impl_->reader.is_open()) return {};
@@ -439,7 +450,7 @@ void PleTable::gather(const uint32_t* rows16, float* out2560) const {
         PleTable* self = const_cast<PleTable*>(this);
         std::string err;
         if (!self->issue(rows16) || !self->collect(out2560, err)) {
-            std::fprintf(stderr, "PleTable::gather: %s\n", err.empty() ? "a token is already in flight" : err.c_str());
+            basalt::log::error("basalt", "PleTable::gather: %s", err.empty() ? "a token is already in flight" : err.c_str());
             std::memset(out2560, 0, (size_t) NG_N_EMBD * sizeof(float));
         }
         return;
