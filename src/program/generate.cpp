@@ -2015,11 +2015,16 @@ int main(int argc, char** argv) {
         // An explicit number truncates the ranked list ("what would 2,000 slots give" without rebuilding the file).
         // `--expert-cache 0` means auto: the profile ranks every pair.
         if (o.expert_cache == 0) o.expert_cache = -1;
-        // Multi-GPU: the peer card gets a share f (0.45) of the HOT pairs, so both cards compute routed experts every
-        // layer.  Of the first 8700 ranks (about the primary's slots), every pair with floor((r+1)f) > floor(rf) moves
-        // to just after that point: the primary fills past them, the peer (which takes what the primary does not hold,
-        // in order) gets them first.
-        if (o.peer_device >= 1) {   // the peer's share of the hot pairs
+        // Multi-GPU: a peer card as fast as the main one gets a share f (0.45) of the HOT pairs, so both cards compute
+        // routed experts every layer.  Of the first 8700 ranks (about the primary's slots), every pair with
+        // floor((r+1)f) > floor(rf) moves to just after that point: the primary fills past them, the peer (which takes
+        // what the primary does not hold, in order) gets them first.  A slower peer card takes the pairs after the
+        // primary's: its fixed hand-off plus a hot expert's entries at its bandwidth end the layer after the primary.
+        const bool slow_peer = chosen_cards.size() == 2 && chosen_cards[0].mem_gbps > 0 && chosen_cards[1].mem_gbps > 0 &&
+                               chosen_cards[1].mem_gbps < 0.9 * chosen_cards[0].mem_gbps;
+        if (o.peer_device >= 1 && slow_peer)
+            basalt::log::info("basalt generate", "peer hot share 0: the peer card's memory is slower than the main card's");
+        if (o.peer_device >= 1 && !slow_peer) {   // the peer's share of the hot pairs
             const double f = 0.45;
             const size_t at = std::min(profile.size(), (size_t) 8700);
             if (f > 0.0 && f < 1.0 && at > 0) {
@@ -2968,7 +2973,8 @@ int main(int argc, char** argv) {
             basalt::log::error("basalt generate", "%s%s", err.c_str(), vram_free_note().c_str());
             return 1;
         }
-        basalt::log::info("basalt generate", "experimental native Q5_K head, %llu bytes, in %.1f s",
+        basalt::log::info("basalt generate", "native head: %s, %llu bytes, in %.1f s",
+                     basalt::ggml_type_name((uint32_t) native_head.type()),
                      (unsigned long long) native_head.weight_bytes(),
                      std::chrono::duration<double>(std::chrono::steady_clock::now() - head_t0).count());
     }
@@ -4391,28 +4397,11 @@ int main(int argc, char** argv) {
     // the first chunk waits for its PLE rows before layer 1 with nothing to overlap, so a short one shrinks that wait.
     // The chunk, and the head chunk (0: none).
     auto one_card_chunks = [&](int64_t tokens, int64_t cap, bool head_ok) -> std::pair<int64_t, int64_t> {
-        int64_t want = request_chunk(tokens, cap);
-        if (want > 0 && tokens > cap) {
-            const int64_t parts = (tokens + cap - 1) / cap;
-            want = request_chunk((tokens + parts - 1) / parts, cap);
-        }
-        int64_t head = 0;
-        if (head_ok && o.prefill_auto_fit && tokens > cap && tokens >= 2 * kHeadChunk && cap > kHeadChunk) {
-            const int64_t rem = tokens - kHeadChunk, parts = (rem + cap - 1) / cap;
-            want = request_chunk((rem + parts - 1) / parts, cap);
-            head = kHeadChunk;
-        }
-        return {want, head};
+        return basalt::program::prompt_one_card_chunks(tokens, cap, head_ok && o.prefill_auto_fit, kHeadChunk);
     };
-    // the sizes of a part's chunks
+    // the sizes of a part's chunks, as the prompt path reads them
     auto chunk_list = [](int64_t tokens, int64_t chunk, int64_t head) {
-        std::vector<int64_t> v;
-        for (int64_t at = 0; chunk > 0 && at < tokens;) {
-            const int64_t T = std::min(at == 0 && head > 0 ? head : chunk, tokens - at);
-            v.push_back(T);
-            at += T;
-        }
-        return v;
+        return basalt::program::prompt_chunk_list(tokens, chunk, head);
     };
     int64_t auto_ceiling = std::max<int64_t>(8192, std::min<int64_t>(o.prefill_auto_max, o.max_context));
     if (o.prefill_auto_fit && !o.resident_cpu_experts) auto_ceiling = 8192;
@@ -4863,6 +4852,7 @@ int main(int argc, char** argv) {
     // layers [lo, hi) and image bytes: both prices, and the split's chunk and head chunk
     struct SplitPricing { basalt::program::PsPrice price; int64_t chunk = 0, head = 0; std::string why; };
     int64_t split_hand_rows = 0;   // the rows each hand-off buffer holds (0 before they exist: a chunk's)
+    int64_t split_peer_rows = 0;   // the longest routed-only chunk a slower tier card computes its experts' rows of
     auto split_price = [&](int64_t a0, int64_t b0, int64_t prompt_end, int max_stages) -> SplitPricing {
         SplitPricing sp0;
         const int64_t n_tok = b0 - a0;
@@ -4871,7 +4861,18 @@ int main(int argc, char** argv) {
         const auto [chunk, head] = one_card_chunks(n_tok, read_cap(), true);
         if (n_tok <= std::max(chunk, head)) return sp0;   // one chunk: read on the main card, no reason to give
         char why[160];
-        if (chunk < 4096) {
+        // a slower tier card that computes its experts' rows of the routed-only chunks of a CUDA0 read: the split
+        // gives that share up and the price does not count it, so those chunks stay on CUDA0; any other tier set keeps
+        // the 4096-token floor
+        if (!peer_streamed_share && split_peer_rows > 0) {
+            if (chunk <= split_peer_rows) {
+                std::snprintf(why, sizeof why, "chunks of %lld tokens: CUDA0 alone reads them with the tier card "
+                              "computing its experts' rows (up to %lld tokens)", (long long) chunk,
+                              (long long) split_peer_rows);
+                sp0.why = why;
+                return sp0;
+            }
+        } else if (chunk < 4096) {
             std::snprintf(why, sizeof why, "chunks of %lld tokens, below the 4096 minimum", (long long) chunk);
             sp0.why = why;
             return sp0;
@@ -5399,6 +5400,7 @@ int main(int argc, char** argv) {
                 basalt::log::warn("basalt serve", "%s - the prompt path stays on the primary GPU", err.c_str());
                 err.clear();
             }
+            split_peer_rows = sp.peer_routed_rows_max();
         }
         // ---- the prompt-time split's stages on the tier cards.  A stage's place, from the end of its tier's slots: the
         // weights, the session (for the whole context here; for its prompt's cells and layers at each read), then the
@@ -9228,9 +9230,9 @@ int main(int argc, char** argv) {
                 const auto t0 = Clock::now();
                 const int64_t n_tok = b0 - a0, chunk = plan.chunk, head = plan.head;
                 const int64_t lb = plan.cuts[0];
-                // the last chunk's first cell: after the head chunk, chunks of `chunk`
-                const int64_t c_last = head > 0 ? a0 + head + ((n_tok - head - 1) / chunk) * chunk
-                                                : a0 + ((n_tok - 1) / chunk) * chunk;
+                // the last chunk's first cell, from the chunks the main card reads (the one it keeps)
+                const std::vector<int64_t> part_chunks = chunk_list(n_tok, chunk, head);
+                const int64_t c_last = b0 - (part_chunks.empty() ? 0 : part_chunks.back());
                 if (sp.chunk() != chunk) {
                     e = "prompt split: the main card's prompt buffers are not laid out for the split's chunk";
                     return false;
@@ -9342,6 +9344,7 @@ int main(int argc, char** argv) {
                 int64_t main_done = a0, yield_q = -1;
                 int yield_ys = -1;
                 std::atomic<int64_t> c_cut{c_last};
+                std::atomic<int64_t> last_end{a0};   // the end of the last chunk the last stage read
                 sp.keep_here = [&](int64_t done) -> bool {
                     if (done >= c_last) return false;
                     int ys = -1;
@@ -9374,6 +9377,7 @@ int main(int argc, char** argv) {
                 // its own last chunk
                 const int64_t first_cell = mtp_on ? std::max<int64_t>(0, mtp.first_needed()) : INT64_MAX;
                 bool given = false;
+                int64_t given_at = -1;   // the cell the stages' state came back up to
                 double ms_copy = 0;
                 std::future<bool> refill_issue;   // the tier slots' copies, queued on a thread of their own
                 std::string refill_err;
@@ -9447,6 +9451,7 @@ int main(int argc, char** argv) {
                         return false;
                     }
                     given = true;
+                    given_at = c_end;
                     ms_copy = std::chrono::duration<double, std::milli>(Clock::now() - tc).count();
                     refill_issue = std::async(std::launch::async, [&] {
                         bool issued = true;
@@ -9510,6 +9515,7 @@ int main(int argc, char** argv) {
                     // its last chunk before the kept one: every stage is done with its own
                     if (p0 + T >= c_cut.load() && !state_back(p0 + T, ce)) return false;
                     const int64_t done = p0 + T;
+                    last_end.store(done);
                     pp_reached = done;
                     const double ms = std::chrono::duration<double, std::milli>(Clock::now() - pp_t0).count();
                     std::printf("PP %lld %lld %.0f %.1f\n", (long long) done, (long long) pp_total, ms,
@@ -9523,11 +9529,17 @@ int main(int argc, char** argv) {
                 sp.keep_here = nullptr;
                 // the kept chunk [c_end, b_end): the last one, or the one a read that gives way ends with (the stages may
                 // have been done before the cut)
-                const int64_t c_end = c_cut.load(), b_end = yield_q >= 0 ? yield_q : b0;
+                const int64_t c_end = c_cut.load();
+                const int64_t b_end = yield_q >= 0 ? yield_q : b0;
                 if (ok && !given && yield_q >= 0) ok = state_back(c_end, e);
-                if (ok && !given) {
+                // the stages' state must come back exactly at the main card's kept chunk: anything else is an error
+                if (ok && (!given || (yield_q < 0 && given_at != c_end))) {
                     ok = false;
-                    e = "prompt split: the stages' state did not come back";
+                    e = "prompt split: the stages' state did not come back at the kept chunk (planned at " +
+                        std::to_string(c_end) + ", the stages ended at " + std::to_string(last_end.load()) +
+                        (given ? ", it came back at " + std::to_string(given_at) : std::string(", it never came back")) +
+                        "; " + std::to_string(n_tok) + " tokens in chunks of " + std::to_string(chunk) + ", head " +
+                        std::to_string(head) + ")";
                 }
                 sp.set_keep_last(false);
                 sp.on_stage_chunk = nullptr;
@@ -10557,11 +10569,6 @@ int main(int argc, char** argv) {
             if (apply_thr.joinable()) apply_thr.join();
             if (copy_live) src.commit_exchanges();   // swaps applied early: the rest of their copies
             copy_live = false;
-            if (!xq_drain()) {   // no swap stays in flight between requests
-                std::printf("ERR an adaptive refill failed\n");
-                return 1;
-            }
-            xq_saturated = false;   // the next request starts at the base cap
             if (ppl != nullptr && !ppl->finish(err)) {
                 std::printf("ERR %s\n", err.c_str());
                 return 1;
@@ -10641,6 +10648,12 @@ int main(int argc, char** argv) {
                         (double) (src.file_read_bytes() - file_bytes0) / 1e6, (long long) read_n,
                         (long long) req_offload);
             std::fflush(stdout);
+            // no swap stays in flight between requests: the last round's copies land once the reply is out
+            if (!xq_drain()) {
+                std::printf("ERR an adaptive refill failed\n");
+                return 1;
+            }
+            xq_saturated = false;   // the next request starts at the base cap
             if (admit_slot >= 0) {   // --batch: BADM <slot> <1 = continues in the batch windows | 0 = done>
                 bool cont = ram_out ? false : in_slot ? !cancelled && (int64_t) live.size() == p
                                     : !cancelled && produced_n == 1 && admit_max_new > 1 && std::strcmp(finish, "length") == 0 &&
