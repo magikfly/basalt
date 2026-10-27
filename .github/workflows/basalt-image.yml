@@ -42,11 +42,25 @@ on:
         description: "Build even if :latest already matches this upstream commit and tree"
         type: boolean
         default: true
+  # Primary trigger. Fork main only ever moves when sync-upstream pushes it,
+  # so start the build when there is something to build rather than at a
+  # clock time GitHub has no obligation to honour: the old 01:15 UTC slot
+  # landed 05:45, 06:07 and 06:14 UTC on its only three scheduled runs and
+  # never once beat the host poll.
+  workflow_run:
+    workflows: ["sync-upstream"]
+    types: [completed]
+  # Fallback, so a build is still owed if the chain breaks (sync disabled,
+  # parent renamed, workflow_run mis-typed). 20:15 UTC + an 18-30 min build
+  # is ~20:45 UTC; the worst lag observed on this account (+4h59m) puts it
+  # at ~01:15 UTC, against a host poll at 04:00 Europe/Amsterdam = 03:00 UTC
+  # (WATCHTOWER_SCHEDULE "0 0 4 * * *", measured 2026-10-27). The comment
+  # this replaces claimed a 04:30 refresh, which was 30 minutes of fiction.
+  # Keep this at least four hours in front of the poll; never tune it
+  # toward the poll, because the lag it must survive is GitHub-side and
+  # unbounded.
   schedule:
-    # 01:15 UTC. A build takes 18-30 min; the host applies :latest at 04:30
-    # Europe/Amsterdam (03:30 UTC in winter), so even a queued runner leaves
-    # slack. Past ~03:00 UTC the update misses the refresh window and waits a day.
-    - cron: "15 1 * * *"
+    - cron: "15 20 * * *"
 
 permissions:
   contents: read     # the tree is read and merged locally, never written back
@@ -66,6 +80,10 @@ jobs:
     name: Merge upstream, build, publish
     runs-on: ubuntu-24.04
     timeout-minutes: 360
+    # A chained run is only meaningful if the sync actually landed: never
+    # let a failed, cancelled or still-running sync publish a stale tree
+    # as :latest. Manual dispatch and schedule are unaffected.
+    if: ${{ github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success' }}
 
     steps:
       - uses: actions/checkout@v7
@@ -196,7 +214,7 @@ jobs:
                 echo "- \`${IMAGE}:latest\` = \`upstream-${{ steps.upstream.outputs.short }}\`"
                 echo "- engine version, shown at Hardware > Engine > Build: \`0.0.1+${{ steps.upstream.outputs.short }}\`"
                 echo "- rebuild recipe: upstream@\`${{ steps.upstream.outputs.sha }}\` + this fork's Dockerfile and .dockerignore"
-                echo "- not applied here: the host picks :latest up on its own 04:30 refresh."
+                echo "- not applied here: the host picks :latest up on its own 04:00 Europe/Amsterdam poll."
                 ;;
               *)
                 echo "- **not published** - :latest is left where it was."
