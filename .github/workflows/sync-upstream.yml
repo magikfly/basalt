@@ -39,7 +39,16 @@ name: sync-upstream
 on:
   workflow_dispatch: {}
   schedule:
-    - cron: "30 0 * * *"   # 00:30 UTC, 45 min before the image build
+    # 18:30 UTC. Deliberately nowhere near the build it feeds. GitHub
+    # delivers `schedule` events to this account 2h17m to 4h59m late
+    # (measured 2026-10-21..27 across basalt, mnemory and intervals-icu-mcp;
+    # createdAt == startedAt, so it is the scheduler, not queueing). A cron
+    # chosen for a tidy local hour therefore has no margin at all. Worst
+    # observed lag puts this run at ~23:30 UTC, still ~7h ahead of the
+    # 04:00 Europe/Amsterdam Watchtower poll. The image build is chained to
+    # this workflow via workflow_run, so it follows within about a minute of
+    # this one finishing instead of racing its own cron.
+    - cron: "30 18 * * *"
 
 permissions:
   contents: write    # sole automated writer of fork main
