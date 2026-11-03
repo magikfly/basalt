@@ -435,6 +435,8 @@ private:
     /// After a two-stage window: the head again over its columns, every row exact (the plain kernel's bits).
     bool head_exact_again() const;
     bool window_intact(std::string& err);   // after a window's sync: false when a bounded device wait of it timed out
+    void ar_handoff();                      // the zero-doorbell window's one hand-off (its rows are staged)
+    bool ar_plan_intact(std::string& err);  // after a zero-doorbell window: false when its plan met an expert out of VRAM
     /// One step of the host's service of the window's rings: 1 = every ring served, 0 = the GPU has not reached the next
     /// one, -1 = an error.
     int serve_poll(PoolMultiFn pool, void* user, std::string& err);
@@ -512,7 +514,6 @@ private:
     bool capture_commit_batch(int R, std::string& err);
     bool stage_batch(const int* slots, const int* lens, int S, int hbase, const int32_t* tokens, const int64_t* pos0,
                      std::string& err);
-    bool batch_seg_ple_ = true;            ///< the window's PLE runs the window kernels (segments of several rows)
     basalt::kernels::SamplerParams sampling_ = [] {
         basalt::kernels::SamplerParams s;
         s.greedy = true;
@@ -533,6 +534,7 @@ private:
     /// the stage is in VRAM.  A prompt loan, a VRAM shrink or an adaptive swap marks some -1: the windows then run the
     /// doorbell graph (exec_nr_ / the batch key's top bit).  refresh_ar() reads the host table before each window.
     bool ar_off_ = false;
+    bool ar_forced_ = false;   ///< --force-zero-doorbell: all_resident_ whatever the residency table says
     bool ar_on() const { return all_resident_ && !ar_off_; }
     void refresh_ar();
     uint32_t* h_plan_err_ = nullptr; uint32_t* m_plan_err_ = nullptr;   // set by resident_plan on a -1 (zero-doorbell graph)
@@ -733,6 +735,7 @@ private:
     float* hist_snap_ = nullptr;                              // T * NG_HIST * NG_HC_DIM
     float* ple_win_ = nullptr;   // 2 * T * NG_HC_DIM
     float *ple_key_ = nullptr, *ple_val_ = nullptr;   // the PLE key / value projections: T * HC * N, T * N
+    void* ple_q8_ = nullptr;     // a native PLE key's q8_1 rows: native_q8_1_bytes(N, T)
     int64_t cap_ = 0, max_blocks_ = 0, attn_scratch_floats_ = 0;
 };
 
