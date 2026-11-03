@@ -4,7 +4,6 @@
 #include "diagnostics.hpp"
 #include "basalt/core/load_progress.hpp"
 #include "basalt/core/verify.hpp"
-#include "basalt/core/remote_expert_opt.hpp"
 #include "basalt/core/on_device.hpp"
 #include "basalt/platform/compiler.hpp"
 #include "basalt/kernels/cpu/pool.hpp"
@@ -130,6 +129,9 @@ bool Verifier::run_begin(int T, const int32_t* tokens, int64_t pos0, std::string
         cudaStreamWaitEvent(cs_, wait_ev_, 0);
         wait_ev_ = nullptr;
     }
+    *(volatile int32_t*) h_head_from_ = head_sampling_ ? std::clamp(head_from_, 0, T) : T;
+    head_from_ = 0;
+    std::atomic_thread_fence(std::memory_order_seq_cst);
     set_head_keep(head_keep());
     if (!hs_launch(T, err)) return false;
     const cudaError_t le = cudaGraphLaunch(ar_off_ ? exec_nr_[T] : exec_[T], cs_);
@@ -140,7 +142,7 @@ bool Verifier::run_begin(int T, const int32_t* tokens, int64_t pos0, std::string
     // a sampled or penalized request's head sampling queued behind the window now, not after a sync
     const bool sampled = !sampling_.greedy && sampling_.temperature > 0.0f;
     const bool biased = sampling_.logit_bias != nullptr;
-    const bool early_sample = chain_on() && le_ >= g.n_layers && head_sampling_ && (sampled || hist_d_ != nullptr || biased);
+    const bool early_sample = le_ >= g.n_layers && head_sampling_ && (sampled || hist_d_ != nullptr || biased);
     // the draft probe: row t asks for the probability of the window's token t + 1
     const bool probe = draft_probe_ && head_sampling_ && sampled && T > 1 && le_ >= g.n_layers;
     // the sampled rows' kept lists; the wide path keeps none
@@ -251,7 +253,6 @@ int Verifier::serve_poll(PoolMultiFn pool, void* user, std::string& err) {
         set_plan_slot();
         const int n = T;
         progress_at("verify window: the CPU experts of layer", l);
-        if (remote_opt_) remote_opt_->begin(h_w_, 0, n);
         if (dm_ != nullptr) {   // the ring's own rows and tiers: the pool computes the CPU's entries only
             const basalt::kernels::DmRing& R = dm_->h_ring[k];
             sink_.ext_kind = R.kind;
@@ -261,7 +262,6 @@ int Verifier::serve_poll(PoolMultiFn pool, void* user, std::string& err) {
         } else if (pool != nullptr)
             pool(user, h_x_, h_ids_, n, ss.k,
                  h_ymiss_, l);
-        if (remote_opt_) remote_opt_->end();
         progress_tick();
         std::atomic_thread_fence(std::memory_order_seq_cst);
         _mm_sfence();

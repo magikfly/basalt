@@ -88,8 +88,13 @@ grammar form) is not enforced.
 The standalone generator starts verification at the last prompt token, including position zero for a one-token
 prompt. The initial window has one row; subsequent windows use the same verifier and draft policy as longer prompts.
 
-Verify guarantees that a token's logits are bit for bit those of plain decode, whatever the window width
-(verify.hpp:3-8). This section tests that end to end.
+In ordinary single-stream decode, verify gives a token the same logits as plain decode, whatever the window width
+(verify.hpp:3-8). This section tests that end to end. The GDN middle of windows of one to four rows runs as the
+mid chain. Windows of five to eight rows do too below 160 SMs; at 160 SMs or more they keep the three separate
+kernels, whose output projection already has the mid chain's reduction order. The width guarantee holds on every device for this path. Profiled runs (`--profile`), batched windows (`--batch`) and a GDN
+mixer split across two cards run the three separate kernels instead; on a device with fewer than 160 SMs their output
+projection rounds differently from the mid chain, so those runs are exact among themselves but not bitwise equal to a
+plain run there.
 
 The default window is 8 tokens (`--spec 8`; an explicit `--spec N` is used as given). Greedy decoding with the drafter
 stays exact at any window. A sampled request is still drawn from the model's own distribution, but the window length
@@ -140,7 +145,7 @@ so KLD with MTP on equals KLD with MTP off; the 0.175 is the quant against the b
   conversation moved to RAM and back keeps its bytes exactly: with the tiers pinned, its next turns write the same
   tokens and accept the same drafts as when it stays in VRAM.
 - The GPU tiers (VRAM and peer card) share one arithmetic; the CPU tier quantizes with ggml's vec_dot_type (Q8_K per 256
-  for i-quant gate/up, against q8_1 per 32 on the GPU; native_expert.cpp:48-49, 76-86). In the quality gate about 0.8% of
+  for i-quant gate/up, against q8_1 per 32 on the GPU; native_expert.cpp:48-49, 74-88). In the quality gate about 0.8% of
   routed experts were computed on the CPU (IQ3_XXS, default placement). The split is fixed per placement, so it is the
   same for spec 0 and spec 7.
 - Prompts are 19 to 395 tokens with 256 new tokens: this tests the decode path, not long context.
@@ -166,7 +171,7 @@ Lossy flags are listed together in one start warning; the routing ones are in [r
 is kept only when it equals the target's own draw at that row (`src/program/serve/request_decode.cpp`, the acceptance loop after
 the verify window). In relaxed mode a draft is also kept when the target gives it probability P or more under the request's
 final distribution (top_k, top_p, min_p, temperature and penalties applied). The sampler reports that probability next to
-its draw (`sample_tokens_probe`, src/kernels/cuda/sampler.cu:1375); the logits and the draws themselves do not change.
+its draw (`sample_tokens_probe`, src/kernels/cuda/sampler.cu:1718); the logits and the draws themselves do not change.
 
 **What changes.** The drafts are the draft head's argmax, fixed by the context. At a row where the draft d has
 p(d) ≥ P, the output is d every time instead of a draw from p: that row is greedy. Its total-variation distance from the

@@ -47,7 +47,6 @@ namespace basalt::kernels { struct DmMixLayer; }
 namespace basalt::core {
 
 class NativeHead;
-class RemoteExpertOpt;
 class PeerExperts;
 struct DecMoe;
 
@@ -114,7 +113,6 @@ public:
     ~Verifier();
     Verifier(const Verifier&) = delete;
     Verifier& operator=(const Verifier&) = delete;
-    void set_remote_expert_opt(RemoteExpertOpt* opt) { remote_opt_ = opt; } // before init/capture
     /// Before init: the window's main stream outranks other streams' kernels (a prompt read running beside the windows).
     void set_main_priority(bool high) { main_high_ = high; }
     /// The peer expert tier the window drives itself (persistent kernel, mapped rings) instead of the pool launching it
@@ -200,6 +198,8 @@ public:
     /// discarded - a prompt read through windows commits every token - so they cost no sampler launch or sync and
     /// never read a history staged for another position.
     void set_head_sampling(bool on) { head_sampling_ = on; if (next_) next_->set_head_sampling(on); }
+    /// Skip exact head scoring below this row for the next window.
+    void set_head_from(int t) { head_from_ = t; if (next_) next_->set_head_from(t); }
     /// On: a sampled window also leaves draft_prob(t), the probability row t's final distribution gives the window's
     /// token t + 1 (t < T - 1), for relaxed acceptance.  The picks are unchanged.  Off by default; set per request.
     void set_draft_probe(bool on) { draft_probe_ = on; if (next_) next_->set_draft_probe(on); }
@@ -251,8 +251,6 @@ public:
     /// Keep the first `n_keep` (1..T) tokens of the last window; advances `ss.ple_prev` by them.  `parts`: 1 launches
     /// the commit graph, 2 advances `ss.ple_prev` (3: both, in that order).
     bool commit(int n_keep, std::string& err, int parts = 3);
-    /// The decode loop's host work off the GPU's critical path (see run() and the serve loop)
-    static bool chain_on();
     /// the residency tables uploaded now (between windows) rather than at the next run()
     bool dm_presync(std::string& err) { return dm_ == nullptr || dm_sync(err); }
     /// Work queued on `s` after this call starts only once the window stream has run everything queued on it so far (the
@@ -395,7 +393,6 @@ public:
 
 private:
     struct WindowRecorder;
-    RemoteExpertOpt* remote_opt_ = nullptr;
     bool main_high_ = false;
     PeerExperts* peer_ = nullptr;
     std::vector<PeerExperts*> xpeers_;
@@ -522,6 +519,8 @@ private:
     }();   ///< greedy by default; per-request via set_sampling
     const int32_t* hist_d_ = nullptr;   // penalty-history row (set_history); null = no penalties apply
     int hist_len_ = 0;
+    int head_from_ = 0;
+    int32_t* h_head_from_ = nullptr; int32_t* m_head_from_ = nullptr;
     bool head_sampling_ = true;          ///< set_head_sampling
     bool draft_probe_ = false;           ///< set_draft_probe
     std::vector<float> logit_bias_host_;
@@ -604,7 +603,6 @@ private:
     bool top_valid_ = false;                                    // the last window wrote them
     float* h_x_ = nullptr;       float* m_x_ = nullptr;         // doorbell payload: T * n_embd
     int32_t* h_ids_ = nullptr;   int32_t* m_ids_ = nullptr;     // T * k
-    float* h_w_ = nullptr;       float* m_w_ = nullptr;         // T * k
     uint32_t* h_seq_ = nullptr;  uint32_t* m_seq_ = nullptr;
     uint32_t* h_flag_ = nullptr; uint32_t* m_flag_ = nullptr;
     uint32_t* h_flagA_ = nullptr; uint32_t* m_flagA_ = nullptr;  // the GPU plan is in place
@@ -623,6 +621,7 @@ private:
     uint32_t* h_pend_ = nullptr; uint32_t* m_pend_ = nullptr;   // the epoch the commit's begin kernel last started
     uint32_t commit_epoch_ = 0;
     int fin_blocks_ = 0;
+    int mid_max_t_ = 4;
     // Lazy GDN layers (lazy_on): the commit graph and the finisher take only the first GDN layer; the later ones are
     // committed inside the next solo window, on lz_s_ from the previous layer's FFN read (that layer's own items and,
     // until the previous layer's combine has its CPU rows, later ones), joined before the layer's GDN kernels.  The
@@ -660,7 +659,7 @@ private:
     uint8_t* xq_ = nullptr;                                   // T columns of q8_1
     uint8_t* sh_xq_ = nullptr;                                // T columns of q8_1 for shared expert branch
     float *qkv_L_ = nullptr, *h_L_ = nullptr, *gate_L_ = nullptr, *beta_L_ = nullptr;   // per GDN layer
-    float *z_ = nullptr, *y_ = nullptr, *y_dummy_ = nullptr;
+    float *z_ = nullptr, *y_ = nullptr;
     float *qfull_ = nullptr, *qcur_ = nullptr, *kcur_ = nullptr, *vcur_ = nullptr, *idx_raw_L_ = nullptr;
     float *qidx_ = nullptr, *scores_ = nullptr, *attn_ = nullptr, *attn32_ = nullptr, *attn_scratch_ = nullptr;
     float* tail_snap_ = nullptr;                              // per QSA layer
@@ -728,6 +727,7 @@ private:
     SessionState* gs_ss_ = nullptr;
     float *gs_h_full_ = nullptr, *gs_h_slice_ = nullptr;   // pinned staging for gs_move: CUDA0's whole layers, the slice
     uint8_t* vhead_scratch_ = nullptr;   // the two-stage head's histogram and row list (q6k_vhead, q80p_vhead)
+    int32_t* head_from_d_ = nullptr;
     int32_t* head_keep_d_ = nullptr;     // q80p_vhead's list length, read by the captured head (null: no such head)
     int head_keep_set_ = 0;              // the value last written to head_keep_d_ (the arena starts it at 0)
     mutable bool head_screened_ = false;   // the last window's head was two-stage: only its top rows are exact

@@ -130,7 +130,7 @@ bool Verifier::WindowRecorder::pre(int64_t l) {
     bool mid_ok = false;
     MidChainArgs ma;
     if (dec_hc && read_q8 && router_multi && !is_qsa_layer(g, l) && !v_.prof_on_ && !v_.batch_rec_ && !gs_split &&
-        n <= kMidChainMaxT && N == 2560 && dec_gdnf_mode() != 0 && (dense_tc_mask() & 4)) {
+        n <= v_.mid_max_t_ && N == 2560 && dec_gdnf_mode() != 0 && (dense_tc_mask() & 4)) {
         const WeightRef *wqkv = v.get("attn_qkv.weight"), *wg = v.get("attn_gate.weight"),
                         *wout = v.get("ssm_out.weight"), *wa = v.get("ssm_alpha.weight"),
                         *wb = v.get("ssm_beta.weight"), *wc = v.get("ssm_conv1d.weight"),
@@ -367,14 +367,9 @@ bool Verifier::WindowRecorder::pre(int64_t l) {
                           v_.hits_.cache_base, v_.slot_off_d_, (long long) v_.hits_.blob,
                           v_.plan_, (long long) v_.max_t_ * K, v_.skip_,
                           (uint32_t) (l - v_.lb_ + 1), cs);
-        if (v_.remote_opt_)   // the helper GPUs reduce with the routing weights - publish them
-            doorbell_publish(xm, v_.ids_, v_.w_, (int64_t) n * N, (int64_t) n * K, v_.m_x_,
-                             v_.m_ids_, v_.m_w_, v_.m_seq_, cs);
-        else {
-            const int32_t* layer_res = v_.hits_.d_res != nullptr ? (v_.hits_.d_res + l * g.n_expert) : nullptr;
-            doorbell_publish_res(xm, v_.ids_, layer_res, (int) g.n_expert, (int64_t) n * N, (int64_t) n * K,
-                                 v_.m_x_, v_.m_ids_, v_.m_seq_, cs);
-        }
+        const int32_t* layer_res = v_.hits_.d_res != nullptr ? (v_.hits_.d_res + l * g.n_expert) : nullptr;
+        doorbell_publish_res(xm, v_.ids_, layer_res, (int) g.n_expert, (int64_t) n * N, (int64_t) n * K,
+                             v_.m_x_, v_.m_ids_, v_.m_seq_, cs);
     }
     stamp(l, 17);
     {
