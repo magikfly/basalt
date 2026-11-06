@@ -126,10 +126,10 @@ class ConfigFile(unittest.TestCase):
         self.assertEqual(flag_value(qfile, "--max-context"), "262144")     # slot-full-context
         self.assertEqual(flag_value(dfile, "--max-context"), "1048576")
 
-    def test_the_ram_guard_switch(self):
-        p = conf({"engine": {"no-ram-guard": True}, "models": [{"model": "a.basalt"}, {"model": "b.basalt"}]})
+    def test_the_ram_reserve(self):
+        p = conf({"engine": {"ram-reserve-mib": 4096}, "models": [{"model": "a.basalt"}, {"model": "b.basalt"}]})
         for _, _, words, _ in model_settings(build_parser(), ["--config", p]):
-            self.assertIn("--no-ram-guard", words)
+            self.assertEqual(flag_value(words, "--ram-reserve-mib"), "4096")
 
     def test_version(self):
         ap = build_parser()
@@ -168,8 +168,11 @@ class ConfigFile(unittest.TestCase):
 
     def test_model_and_alias_do_not_go_with_a_config(self):
         p = conf({"models": [{"model": "a.basalt"}]})
-        for extra in (["--model", "b.basalt"], ["--alias", "x"]):
-            with self.assertRaisesRegex(ValueError, "set in a model entry"):
+        for extra, text in ((["--model", "b.basalt"], "^--model is not supported when using a config file$"),
+                            (["--alias", "x"], "^--alias is not supported when using a config file$"),
+                            (["--model", "b.basalt", "--alias", "x"],
+                             "^--model and --alias are not supported when using a config file$")):
+            with self.assertRaisesRegex(ValueError, text):
                 model_settings(build_parser(), ["--config", p, *extra])
 
     def test_the_command_line_applies_to_every_model(self):

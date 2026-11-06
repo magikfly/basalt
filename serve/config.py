@@ -223,8 +223,10 @@ def model_settings(ap: argparse.ArgumentParser, cli: list[str], refused=None) ->
     a_cli = ap.parse_known_args(cli)[0]
     if not a_cli.config:
         return [parse_settings(ap, cli)]
-    if a_cli.model or a_cli.alias:
-        raise ValueError("--model and --alias are set in a model entry")
+    given = [f for f, v in (("--model", a_cli.model), ("--alias", a_cli.alias)) if v]
+    if given:
+        verb = "is" if len(given) == 1 else "are"
+        raise ValueError(f"{' and '.join(given)} {verb} not supported when using a config file")
     cfg = load_config_file(a_cli.config, ap)
     out = []
     for entry in cfg.models:
@@ -544,6 +546,8 @@ def build_parser() -> argparse.ArgumentParser:
                     help="also answer to this Host name (repeatable; \"*\" turns the check off)")
     ap.add_argument("--cors-origin", action="append", default=[], metavar="ORIGIN",
                     help="let web pages from this origin use /v1/* (repeatable)")
+    ap.add_argument("--max-payload-mib", type=int, default=256, metavar="MIB",
+                    help="the largest request body the server reads, in MiB; a bigger one gets a 413 (default 256)")
     ap.add_argument("--debug", action="store_true",
                     help="log one line per request and the raw model text after each reply")
     ap.add_argument("--request-lines", action="store_true",

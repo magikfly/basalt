@@ -78,6 +78,7 @@ struct LoadRequest {
     std::vector<int> peer_devices;    ///< CUDA devices of the expert tier cards after the main one
     int64_t max_context = 0;          ///< --max-context, or the default every model shares
     int sessions = 1;                 ///< sessions the model will be asked for (--batch)
+    bool vision = false;              ///< --vision: requests may carry images (each slot keeps buffers for one)
     std::string expert_profile;       ///< the routing order of the experts (empty: the file's own order)
     int expert_cache = 0;             ///< VRAM expert slots over all layers (0 or -1: from the free memory)
     uint64_t resident_budget = 0;     ///< bytes the RAM tier may take (0: from the free memory)
@@ -228,6 +229,8 @@ public:
     virtual int planned_spec(const program::CommonOptions& o) const;
     /// The flags the quality gate starts this model with, space separated.
     virtual const char* quality_flags() const { return ""; }
+    /// The model's name as a community benchmark row records it; empty for a model that has none.
+    virtual const char* model_name() const { return ""; }
     /// The widest window the gate scores on this model; 0 takes what the request asks.
     virtual int quality_window() const { return 1; }
     /// The cards that may hold experts beside the main one.
