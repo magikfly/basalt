@@ -39,7 +39,7 @@ A config file is one JSON object. `models` lists the models; `engine` applies to
 ## Automatic settings
 
 When left out, the engine picks `peer-exclusive`, `resident` (`resident-budget-gib`), `pool-affinity` and `pool-workers`. A given value
-always wins. It prints one `[server] auto` line:
+always wins. It prints one `[server] auto` line, where `ram-experts` is the `resident` amount (the experts held in RAM, not the whole model):
 
 | Setting | Rule |
 | --- | --- |
@@ -89,8 +89,8 @@ Command line `--name`; the Where column says which config block takes it.
 | Setting | Where | Type, values | Default | What it does |
 | --- | --- | --- | --- | --- |
 | `max-context` | engine | tokens | 8192 | Longest context. Shared by `parallel` slots. The KV cache grows with it. |
-| `kv` | engine | `fp16`, `int8`, `q4_0`, `k8v4` | `fp16` | Flash-Next only. KV storage. `int8` halves VRAM. `q4_0` is 4-bit after rotation; `k8v4` keeps K int8 and V 4-bit (816 bytes per cell against `int8`'s 1,056). Not with `kv-resident`. |
-| `kv-resident` | engine | cells (min 20,480) or `0` | 0 | Flash-Next only. Keep N cells of KV in VRAM and the rest in pinned RAM. |
+| `kv` | engine | Flash-Next: `fp16`, `int8`, `q4_0`, `k8v4`; DeepSeek: `fp8`, `fp16` | Flash-Next `fp16`, DeepSeek `fp8` | KV storage. Flash-Next: `int8` halves VRAM; `q4_0` is 4-bit after rotation; `k8v4` keeps K int8 and V 4-bit (816 bytes per cell against `int8`'s 1,056); not with `kv-resident`. DeepSeek: `fp8` rounds as the model's reference (FP8 window rows, FP4 compressed rows and index keys, 920 bytes per position); `fp16` keeps the unrounded values (3,200 bytes per position). A model refuses the other's values. |
+| `kv-resident` | engine | cells (min 20,480) or `0` | 0 | Flash-Next only. Keep N cells of KV in VRAM and the rest in pinned RAM. With `parallel` and `kv` `int8`, every slot streams its own K/V this way. |
 | `rope-scaling` | engine | `none`, `linear`, `yarn` | model's, else `none` | Flash-Next only. Extend past the trained length. Fixed for the run. |
 | `rope-scale` | engine | number | model's, else 1 | Flash-Next only. Factor for `linear` and `yarn`. |
 | `rope-freq-base`, `rope-freq-scale` | engine | number | 0 (model's own) | Flash-Next only. Raw RoPE values. Leave at 0 unless you know them. |
@@ -126,7 +126,7 @@ Command line `--name`; the Where column says which config block takes it.
 | `prefill-cpu-share` | engine | 0 to 1 | 0.6 | Flash-Next only. Share of streamed prompt experts the CPU computes. Fixed, so output is the same run to run. |
 | `short-read` | engine | tokens | 64 (`0` = off) | Flash-Next only. A fresh part of at most N tokens is read through decode windows. |
 | `no-prompt-skip` | engine | switch | off | DeepSeek only. Run every row through every layer. Slower; the same math. [precision](../precision/deepseek41.md#prompt-skip) |
-| `peer-prefill-rows` | engine | rows per layer | half of chunk x top-k | Flash-Next only. Prompt rows per layer the peer card computes. `0` keeps the prompt on the main card. |
+| `no-peer-prefill` | engine | switch | off | Flash-Next only. The peer card computes none of the prompt rows; the prompt stays on the main card. |
 
 ## Drafting
 
@@ -147,7 +147,7 @@ Unless `relaxed-drafting` is on, output is exactly plain decoding's.
 
 | Setting | Where | Type, values | Default | What it does |
 | --- | --- | --- | --- | --- |
-| `parallel` | entry | 1..8 | 1 | Serve N requests at once. Sets the engine's `batch`. |
+| `parallel` | entry | 1..8 | 1 | Serve N requests at once. Sets the engine's `batch`. With `kv-resident`, each slot keeps only those cells in VRAM. |
 | `slot-full-context` | entry | switch | off | Give every slot the whole `max-context`, at N times the KV. |
 
 ## Conversation cache

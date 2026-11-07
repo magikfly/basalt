@@ -1,5 +1,6 @@
 // src/models/qwen4exp/serve/conversation.cpp - conversation operations for the persistent engine.
 #include "basalt/models/qwen4exp/shared_names.hpp"
+#include "basalt/protocol.hpp"
 #include "qfn_state.hpp"
 #include "basalt/models/qwen4exp/decode/kv_arena.hpp"
 
@@ -40,7 +41,7 @@ uint64_t conversation_identity(const Options& o, const basalt::core::ModelGeomet
                   o.rope_freq_base, o.rope_freq_scale, o.yarn_orig_ctx, o.yarn_ext_factor, o.yarn_attn_factor,
                   o.yarn_beta_fast, o.yarn_beta_slow, o.cvec_first, o.cvec_last, o.cvec_mode, o.cvec_single);
     std::string text = std::string("basalt conversation state kv ") + o.kv + " rope " +
-                       o.rope_scaling + num + " mtp " + o.mtp + " mmproj " + o.vision_mmproj;
+                       o.rope_scaling + num + " mtp " + o.mtp + " vision_in_engine " + (o.vision_in_engine ? "1" : "0");
     for (const auto& [path, scale] : o.cvec_files) text += " cvec " + path + " " + std::to_string(scale);
     uint64_t h = conversation_store_hash(text.data(), text.size(), 1);
     const int64_t geo[] = {g.n_embd, g.n_layers, g.qsa_interval, g.ssm_state_size, g.ssm_v_heads, g.n_head_kv,
@@ -178,6 +179,7 @@ bool QfnRuntime::park_current(size_t held, int64_t kept) {
         }
         basalt::core::SavedConversation image;
         size_t reused_bytes = 0;
+        if (draft0 != nullptr && !mtp.snapshot_main(err)) return false;   // a streamed draft ring's own window
         if (!basalt::core::conversation_snapshot_save(image, view, *rsp, g, draft0, err,
                 std::move(reuse), &reused_bytes)) return false;
         for (size_t k = 0; k < n_st; ++k) {   // the later stages
@@ -307,7 +309,8 @@ size_t QfnRuntime::spill_to_disk(bool at_exit, size_t limit) {
         try {
             const auto t0 = Clock::now();
             basalt::core::SavedConversation image;
-            if (!basalt::core::conversation_snapshot_save(image, view, s, g, mtp_kv, se)) {
+            if ((mtp_kv != nullptr && !mtp.snapshot_main(se)) ||   // a streamed draft ring's own window
+                !basalt::core::conversation_snapshot_save(image, view, s, g, mtp_kv, se)) {
                 basalt::log::warn("basalt serve", "conversation cache: not written to disk (%s)", se.c_str());
                 return;
             }
@@ -567,9 +570,8 @@ int QfnRuntime::init_conversations() {
         if (ms - last_ms < 500.0 && ms >= last_ms) return;
         last_ms = ms;
         const int64_t at = p0 + T * layers_done / n_layers;
-        std::printf("PL %lld %lld %.0f %.1f\n", (long long) at, (long long) pp_total, ms,
-                    ms > 0.0 ? 1000.0 * (double) (at - pp_from) / ms : 0.0);
-        std::fflush(stdout);
+        basalt::protocol::emit("PL %lld %lld %.0f %.1f\n", (long long) at, (long long) pp_total, ms,
+                               ms > 0.0 ? 1000.0 * (double) (at - pp_from) / ms : 0.0);
     };
     sp.on_chunk = [&](const float* R_rows, int64_t T, int64_t p0, std::string& e) -> bool {
         std::vector<int32_t> nxt((size_t) T);

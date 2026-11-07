@@ -2,12 +2,15 @@
 #include "basalt/log.hpp"
 #include "models/deepseek41/tier.hpp"
 
+#include "basalt/core/device.hpp"
+
 #include "basalt/core/load_progress.hpp"
 #include <optional>
 
 #include "basalt/core/expert_source.hpp"
 #include "basalt/platform/file.hpp"
 #include "basalt/platform/memory.hpp"
+#include "basalt/prefill/moe_mmq.hpp"
 #include "models/deepseek41/model.hpp"
 #include "models/deepseek41/prefill_plan.hpp"
 
@@ -102,43 +105,57 @@ bool ExpertTier::open(const Reserve& reserve, float* h_rows, std::string& err) {
     if (m_.peer_device() >= 0) {
         peer_ = std::make_unique<core::PeerExperts>();
         std::string pe;
-        if (peer_->open_plain(m_.peer_device(), n_layers_, n_expert_, g.n_embd, g.n_ff_exp, h_rows, pe)) {
+        if (peer_->open_plain(m_.peer_device(), n_layers_, n_expert_, g.n_embd, g.n_ff_exp, h_rows, pe) && open_share(pe)) {
             peer_slots = slots_in(peer_->room(), (uint64_t) m_.tiers().peer_reserve_mib << 20);
         } else {
+            share_.reset();
             basalt::log::warn("basalt deepseek41", "second card not used: %s", pe.c_str());
             peer_.reset();
         }
     }
 
-    // The prompt and image buffers first, so the free memory the tier reads already lacks them. The ring holds five layers
-    // of the second card's homes, or its cap when experts may stay in the file.
-    auto available = [] {
-        core::detail::HostMemory hm;
-        return core::detail::host_available_memory(hm) ? hm.available : 0;
-    };
+    // The prompt and image buffers first, so the free memory the tier reads already lacks them. The ring of file reads
+    // comes only when experts may stay in the file.
+    core::detail::HostMemory hm;
+    auto available = [&] { return core::detail::host_available_memory(hm) ? hm.available : 0; };
     const uint64_t ram_reserve = platform::ram_reserve();
-    const int peer_homes = std::min(peer_slots, n_expert_);
-    if (!host_.open(m_, std::min(prefillp::kRingPieces, prefillp::kRing * peer_homes), m_.sessions(), m_.tiers().vision, err))
+    // the image encoder's cuBLAS handle takes host memory when created, so it is taken before the reading
+    if (m_.tiers().vision && !m_.vision_blas().open(err))
+        return false;
+    if (!host_.open(m_, 0, m_.sessions(), m_.tiers().vision, err))
         return false;
     uint64_t avail = available();
-    auto ram_in = [&] {   // places per layer above the reserve, less the spare each layer keeps
-        const uint64_t places = core::ram_tier_room(avail, ram_reserve, true) / one_each_ram;
-        int slots = (int) std::min<uint64_t>(places > 0 ? places - 1 : 0, (uint64_t) n_expert_);
+    // places per layer above the reserve, less the spare each layer keeps, in `bytes` of RAM
+    auto places_in = [&](uint64_t bytes) {
+        const uint64_t places = core::ram_tier_room(bytes, ram_reserve, true) / one_each_ram;
+        return places > 0 ? places - 1 : 0;
+    };
+    const bool ram_given = m_.tiers().resident_budget > 0 || m_.diag_tier_ram() >= 0;
+    auto ram_in = [&] {
+        int slots = (int) std::min<uint64_t>(places_in(avail), (uint64_t) n_expert_);
         if (m_.tiers().resident_budget > 0)
             slots = std::min(slots, (int) std::min<uint64_t>(m_.tiers().resident_budget / one_each_ram, (uint64_t) n_expert_));
         if (m_.diag_tier_ram() >= 0) slots = std::min(m_.diag_tier_ram(), n_expert_);
         return slots;
     };
     int ram_slots = ram_in();
-    if (ram_slots < n_expert_ - peer_homes) {
+    // what the machine can give the tier whatever else runs: its RAM (or the container's) less the engine's own buffers.
+    // The home-versus-copies choice reads this alone, so the cache state at start never moves it.
+    const uint64_t total = std::min(platform::total_physical_memory(), hm.cgroup_limit);
+    const int ram_cap = ram_given ? -1 : (int) std::min<uint64_t>(places_in(total > host_.bytes() ? total - host_.bytes() : 0), 1u << 20);
+    homes_ = policy::plan_homes(n_expert_, main_homes, peer_slots, ram_slots, ram_cap);
+    if (homes_.file > 0) {   // experts stay in the file: the ring of its reads takes RAM before the tier is sized
         if (!host_.set_ring(prefillp::kRingPieces, err)) return false;
         avail = available();
         ram_slots = ram_in();
+        homes_ = policy::plan_homes(n_expert_, main_homes, peer_slots, ram_slots, ram_cap);
     }
-    homes_ = policy::plan_homes(n_expert_, main_homes, peer_slots, ram_slots);
     const uint64_t ram_floor =
         ram_reserve + (homes_.ram > 0 ? core::pin_tracking_bytes((uint64_t) (homes_.ram + 1) * one_each_ram) : 0);
-    if (homes_.peer == 0) peer_.reset();
+    if (homes_.peer == 0) {
+        share_.reset();
+        peer_.reset();
+    }
 
     // the base arena (homes, or copies a long prompt borrows) leaves its reserve free; grow() fills it beside a short prompt
     reserve_ = reserve.beside_homes;
@@ -208,6 +225,37 @@ bool ExpertTier::open(const Reserve& reserve, float* h_rows, std::string& err) {
     program::warn_spill(spill(), peer_ ? "" : ", or --gpu 0,1");
     basalt::log::info("basalt deepseek41", "VRAM expert tier %.2f GiB, %lld of %d experts per layer (%.0f%%); CPU pool %d workers",
                  cache_.gib(), (long long) per_layer_, n_expert_, 100.0 * (double) per_layer_ / n_expert_, pool_->workers());
+    return true;
+}
+
+// The second card's prompt share takes its buffers before the card's slots are sized, and each layer's prices.
+bool ExpertTier::open_share(std::string& err) {
+    const Geometry& g = m_.geo();
+    prefill::PeerShare::Dims d;
+    d.n_embd = g.n_embd;
+    d.n_ff = g.n_ff_exp;
+    size_t stride = 0;
+    for (const ExpertLayer& el : m_.pack().experts) stride = std::max<size_t>(stride, staged_stride(el));
+    d.group_bytes = stride * (size_t) d.launch_experts;
+    d.act_bytes = prefill::mmq::q8_bytes(prefillp::kMaxChunk, g.n_embd);
+    d.max_tokens = prefillp::kMaxChunk;
+    d.max_rows = (int64_t) prefillp::kMaxChunk * g.n_used;
+    d.n_expert = n_expert_;
+    int main_dev = 0;
+    cudaGetDevice(&main_dev);
+    share_ = std::make_unique<prefill::PeerShare>();
+    if (!share_->open(main_dev, peer_->device(), d, err)) return false;
+    // a row of a layer's products is three matrices of n_embd x n_ff multiply-adds
+    const core::DeviceRates r0 = core::device_rates(main_dev), r1 = core::device_rates(peer_->device());
+    const double macs = 3.0 * (double) g.n_embd * (double) g.n_ff_exp;
+    rates_.assign((size_t) n_layers_, {});
+    for (prefill::ShareRates& r : rates_) {
+        r.link0 = r0.link_bytes;
+        r.link1 = r1.link_bytes;
+        r.rows0 = r0.sm_hz * prefill::kMmqMacsPerSmCycle / macs;
+        r.rows1 = r1.sm_hz * prefill::kMmqMacsPerSmCycle / macs;
+        r.sm_hz0 = r0.sm_hz;
+    }
     return true;
 }
 
