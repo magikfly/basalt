@@ -49,14 +49,12 @@ ExpertTier::~ExpertTier() {
         worker_.join();
     }
     report("final");
+    flush_queue();
     if (peer_ && !peer_moves_.empty()) {
         std::string e;
         peer_->read_wait(e);
     }
-    if (copy_stream_) {
-        flush_queue();
-        cudaStreamSynchronize(copy_stream_);
-    }
+    if (copy_stream_) cudaStreamSynchronize(copy_stream_);
     if (fetch_stream_) cudaStreamSynchronize(fetch_stream_);
     for (cudaEvent_t e : events_) cudaEventDestroy(e);
     if (fetch_ev_) cudaEventDestroy(fetch_ev_);
@@ -80,9 +78,10 @@ bool ExpertTier::open(const Reserve& reserve, float* h_rows, std::string& err) {
         one_each += (e.blob_bytes + 255) / 256 * 256;
         one_each_ram += e.blob_bytes;
     }
-    size_t free_b = 0, total_b = 0;
-    if (cudaMemGetInfo(&free_b, &total_b) != cudaSuccess) {
-        err = "deepseek41: cannot query the free device memory";
+    uint64_t free_b = 0, total_b = 0;
+    std::string why;
+    if (!core::device_memory(-1, free_b, total_b, why)) {
+        err = "deepseek41: cannot query the free device memory: " + why;
         return false;
     }
     one_each_ = one_each;
@@ -119,6 +118,7 @@ bool ExpertTier::open(const Reserve& reserve, float* h_rows, std::string& err) {
     core::detail::HostMemory hm;
     auto available = [&] { return core::detail::host_available_memory(hm) ? hm.available : 0; };
     const uint64_t ram_reserve = platform::ram_reserve();
+    uint64_t tier_reserve = ram_reserve;   // and the file cache's floor once experts stay in the file
     // the image encoder's cuBLAS handle takes host memory when created, so it is taken before the reading
     if (m_.tiers().vision && !m_.vision_blas().open(err))
         return false;
@@ -127,7 +127,7 @@ bool ExpertTier::open(const Reserve& reserve, float* h_rows, std::string& err) {
     uint64_t avail = available();
     // places per layer above the reserve, less the spare each layer keeps, in `bytes` of RAM
     auto places_in = [&](uint64_t bytes) {
-        const uint64_t places = core::ram_tier_room(bytes, ram_reserve, true) / one_each_ram;
+        const uint64_t places = core::ram_tier_room(bytes, tier_reserve, true) / one_each_ram;
         return places > 0 ? places - 1 : 0;
     };
     const bool ram_given = m_.tiers().resident_budget > 0 || m_.diag_tier_ram() >= 0;
@@ -147,11 +147,18 @@ bool ExpertTier::open(const Reserve& reserve, float* h_rows, std::string& err) {
     if (homes_.file > 0) {   // experts stay in the file: the ring of its reads takes RAM before the tier is sized
         if (!host_.set_ring(prefillp::kRingPieces, err)) return false;
         avail = available();
+        // and they read through the OS file cache, which keeps its floor beside the reserve (the ring holds a prompt's
+        // reads, so only the layers count)
+        core::FileCache cache;
+        for (const auto& e : m_.pack().experts) cache.layer_bytes = std::max<uint64_t>(cache.layer_bytes, (uint64_t) n_expert_ * e.blob_bytes);
+        if (!ram_given)
+            tier_reserve = ram_reserve + core::file_cache_keep(avail, ram_reserve, true,
+                                                               (uint64_t) (homes_.ram + homes_.file + 1) * one_each_ram, cache);
         ram_slots = ram_in();
         homes_ = policy::plan_homes(n_expert_, main_homes, peer_slots, ram_slots, ram_cap);
     }
     const uint64_t ram_floor =
-        ram_reserve + (homes_.ram > 0 ? core::pin_tracking_bytes((uint64_t) (homes_.ram + 1) * one_each_ram) : 0);
+        tier_reserve + (homes_.ram > 0 ? core::pin_tracking_bytes((uint64_t) (homes_.ram + 1) * one_each_ram) : 0);
     if (homes_.peer == 0) {
         share_.reset();
         peer_.reset();
@@ -276,7 +283,7 @@ public:
         for (int64_t e = 0; e < env.n_expert && (int) ids_.size() < 8; ++e)
             if (peer_.slot_ptr(0, e) != nullptr) ids_.push_back((int32_t) e);
         if (ids_.empty()) { why = "no_experts_on_peer"; return false; }
-        if (!x_.alloc((size_t) f.n_embd * sizeof(float), cudaHostAllocPortable)) { why = "alloc_failed"; return false; }
+        if (!x_.alloc((size_t) f.n_embd * sizeof(float), cudaHostAllocPortable | cudaHostAllocMapped)) { why = "alloc_failed"; return false; }
         std::mt19937 rng(5);
         std::normal_distribution<float> nd(0.f, 1.f);
         for (int64_t i = 0; i < f.n_embd; ++i) ((float*) x_.p)[i] = nd(rng);
@@ -441,6 +448,16 @@ bool ExpertTier::load_ram(std::string& err) {
         if (unpinned > 0)
             basalt::log::warn("basalt deepseek41", "RAM expert tier: %d of %d layers not pinned, locked: %s", unpinned, n_layers_,
                               ram_pins_[(size_t) n_layers_ - 1].lock_note.c_str());
+        // Pinned past what the driver backs, the runtime stops answering on every card, and returning the pages does not
+        // bring it back: the start ends here rather than at the first request.
+        std::vector<int> cards{-1};   // the main card is the current one
+        if (peer_) cards.push_back(peer_->device());
+        std::string dead;
+        if (!core::devices_allocate(cards, dead)) {
+            err = "deepseek41: the device cannot allocate after pinning the RAM tier (" + dead +
+                  "); pin less with a smaller --resident-budget-gib";
+            return false;
+        }
     }
     if (ram_load) ram_load->finish();
     if (main_load) main_load->finish();
@@ -528,6 +545,7 @@ void ExpertTier::drain() {
     }
     pending_.clear();
     if (peer_moves_.empty()) return;
+    pump_peer(kAllPieces);
     std::string err;
     peer_->read_wait(err);
     for (const PeerMove& m : peer_moves_) {
@@ -770,11 +788,13 @@ bool ExpertTier::move_to_peer(int layer, int e, const uint8_t* src) {
     }
     uint64_t on_main = ~0ull;
     oldest_slot(layer, /*homes_too=*/true, on_main);
-    if (slot < 0 || oldest >= on_main) return false;
+    // the second card computes an expert ~3.6x slower than the main card: a promotion goes there only when what it
+    // replaces has gone unused well longer than the main card's oldest
+    if (slot < 0 || oldest + policy::kPeerMoveAge >= on_main) return false;
     const int32_t place = spare_[(size_t) layer];
     spare_[(size_t) layer] = -1;
     const uint64_t bytes = m_.pack().experts[(size_t) layer].blob_bytes;
-    peer_->exchange_slot(slot, ram_[(size_t) layer] + (size_t) place * bytes, src, bytes);
+    peer_queue_.push_back({slot, ram_[(size_t) layer] + (size_t) place * bytes, src, bytes});
     peer_moves_.push_back({layer, e, peer_owner_[(size_t) slot], slot, place});
     peer_owner_[(size_t) slot] = e;
     ++promoted_;
@@ -823,12 +843,30 @@ int32_t ExpertTier::claim(int layer, int e, const uint8_t* src, cudaStream_t str
 }
 
 void ExpertTier::mark_gap(cudaStream_t main) {
-    gap_marked_ = !queue_.empty() && cudaEventRecord(gap_ev_, main) == cudaSuccess;
+    gap_marked_ = (!queue_.empty() || !peer_queue_.empty()) && cudaEventRecord(gap_ev_, main) == cudaSuccess;
+}
+
+void ExpertTier::pump_peer(int pieces) {
+    size_t done = 0;
+    for (; done < peer_queue_.size() && pieces > 0; ++done) {
+        PeerQueued& q = peer_queue_[done];
+        for (; q.out_off < q.bytes && pieces > 0; q.out_off += policy::kPieceBytes, --pieces)
+            peer_->slot_out(q.slot, q.to, q.out_off, std::min(policy::kPieceBytes, q.bytes - q.out_off));
+        for (; q.out_off >= q.bytes && q.in_off < q.bytes && pieces > 0; q.in_off += policy::kPieceBytes, --pieces)
+            peer_->slot_in(q.slot, q.from, q.in_off, std::min(policy::kPieceBytes, q.bytes - q.in_off));
+        if (q.in_off < q.bytes) break;
+    }
+    peer_queue_.erase(peer_queue_.begin(), peer_queue_.begin() + (std::ptrdiff_t) done);
 }
 
 void ExpertTier::pump(int pieces) {
-    if (gap_marked_) cudaStreamWaitEvent(copy_stream_, gap_ev_, 0);
+    if (gap_marked_) {
+        cudaStreamWaitEvent(copy_stream_, gap_ev_, 0);
+        if (!peer_queue_.empty()) peer_->copies_after(gap_ev_);
+    }
     gap_marked_ = false;
+    // the second card's own bus: what one head leaves it (the rest at the window's end)
+    if (!peer_queue_.empty()) pump_peer(pieces == kAllPieces ? pieces : std::min(pieces, policy::kPeerGapPieces));
     if (queue_.empty()) return;
     size_t done = 0;
     for (; done < queue_.size() && pieces > 0; ++done) {
@@ -916,9 +954,10 @@ void ExpertTier::lend_all() {
 
 bool ExpertTier::reclaim(std::string& err) {
     if (lent_per_layer_ == 0) return true;
-    size_t free_b = 0, total_b = 0;
-    if (cudaMemGetInfo(&free_b, &total_b) != cudaSuccess) {
-        err = "deepseek41: cannot query the free device memory";
+    uint64_t free_b = 0, total_b = 0;
+    std::string why;
+    if (!core::device_memory(-1, free_b, total_b, why)) {
+        err = "deepseek41: cannot query the free device memory: " + why;
         return false;
     }
     const int64_t n = policy::reclaim_slots(free_b, reserve_, free_floor_, one_each_, lent_per_layer_);
@@ -936,8 +975,13 @@ bool ExpertTier::reclaim(std::string& err) {
 
 void ExpertTier::grow() {
     if (ext_per_layer_ > 0 || per_layer_ >= n_expert_ || !cache_.valid()) return;
-    size_t free_b = 0, total_b = 0;
-    if (cudaMemGetInfo(&free_b, &total_b) != cudaSuccess) return;
+    uint64_t free_b = 0, total_b = 0;
+    std::string why;
+    if (!core::device_memory(-1, free_b, total_b, why)) {
+        if (!unread_said_) basalt::log::warn("basalt deepseek41", "VRAM expert tier cannot grow: cannot read the free device memory: %s", why.c_str());
+        unread_said_ = true;
+        return;
+    }
     const int64_t n = policy::grow_slots(free_b, reserve_ + (token_ > 0 ? 0 : modules_), free_floor_, one_each_, per_layer_, n_expert_, cap_per_layer_);
     if (n < 1) return;
     std::vector<int64_t> slot_bytes;
