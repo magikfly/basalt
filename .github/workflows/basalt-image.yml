@@ -74,6 +74,9 @@ env:
   UPSTREAM_REPO: jesdga95/basalt
   IMAGE: ghcr.io/magikfly/basalt
   CUDA_ARCH: "120"
+  # Paths this fork owns. The merged build tree always carries this fork's
+  # copy of them, never a hybrid with upstream's same-named files.
+  FORK_PATHS: .github Dockerfile .dockerignore
 
 jobs:
   image:
@@ -107,12 +110,35 @@ jobs:
           echo "short=${SHA:0:12}" >> "$GITHUB_OUTPUT"
           echo "ahead=$(git rev-list --count HEAD..$SHA)" >> "$GITHUB_OUTPUT"
 
-          if ! git merge --no-edit --no-ff "$SHA" \
-               -m "Merge upstream $UPSTREAM_REPO main ($SHA)"; then
-            echo "::error::Merge conflict with upstream; nothing was built or published. Fork-owned paths are Dockerfile, .dockerignore and .github/workflows/ - if upstream has added one of those, reconcile it by hand."
+          OURS="$(git rev-parse HEAD)"
+
+          # Same contract as sync-upstream.yml, and this job needs the pin even
+          # more than that one does: it builds straight from the merged tree, so
+          # a cleanly merging upstream Dockerfile would silently become the
+          # recipe that ships this registry. Upstream added its own container
+          # definition on 2026-11-08, which is also the day the bare merge below
+          # started failing. Merge without committing, restore the fork paths
+          # from $OURS, then fail only on a conflict in upstream's own source.
+          git merge --no-edit --no-ff --no-commit "$SHA" \
+               -m "Merge upstream $UPSTREAM_REPO main ($SHA)" || true
+
+          for p in ${FORK_PATHS}; do
+            rm -rf "$p"
+            git checkout "$OURS" -- "$p"
+          done
+          # Staging clears the conflict entries the pin just resolved.
+          git add -A -- ${FORK_PATHS}
+
+          # Still unmerged means upstream's own source collided. This fork edits
+          # none of that, so a human has to look.
+          if [ -n "$(git ls-files -u)" ]; then
+            echo "::error::Merge conflict in upstream-owned source; nothing was built or published. This fork edits none of that, so it needs a human."
             git diff --name-only --diff-filter=U
+            git merge --abort || true
             exit 1
           fi
+
+          git commit --no-edit --no-verify || true
 
           # Everything that changes an image's bytes besides the upstream source:
           # the container recipe, what the build context excludes, the target

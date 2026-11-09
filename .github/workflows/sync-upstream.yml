@@ -19,6 +19,14 @@ name: sync-upstream
 # A stalled sync costs provenance, not updates: basalt-image.yml merges upstream
 # independently, so the box keeps receiving images while main sits.
 #
+# Upstream grew its own container recipe and CI on 2026-11-08 (a Dockerfile, a
+# .dockerignore, .github/workflows/release.yml, a rewritten ci.yml). Those paths
+# now collide with this fork's pinned copies whenever upstream touches them, so
+# the merge takes the fork's side for pinned paths and reports what it declined,
+# instead of aborting. Upstream's own source still conflicts loudly, and the
+# decision to adopt upstream's container recipe is a human one: see
+# services.basalt.image_ci in the netvault before changing FORK_PATHS.
+#
 # The push never carries upstream's workflow files - .github/ is pinned to this
 # fork's own copies, file for file. Two load-bearing reasons:
 #   - the resulting commit touches nothing under .github/workflows/, so it needs
@@ -96,13 +104,21 @@ jobs:
             exit 0
           fi
 
-          if ! git merge --no-edit --no-ff "$SHA" \
-               -m "Merge upstream ${UPSTREAM_REPO} main ($SHA)"; then
-            echo "::error::Merge conflict with upstream. main is unchanged, nothing was pushed, and no image is blocked - basalt-image.yml merges upstream on its own."
-            git diff --name-only --diff-filter=U || true
-            git merge --abort || true
-            exit 1
-          fi
+          # Merge without committing. A collision inside a fork-owned path is
+          # expected and must not stop the sync: those paths are rewritten from
+          # $OURS below regardless of what git decided. Stopping on them is what
+          # killed both nightly workflows on 2026-11-08, when upstream added its
+          # own Dockerfile and .dockerignore and edited its ci.yml. A conflict in
+          # upstream's OWN source still stops the job - see the check after the
+          # pin.
+          git merge --no-edit --no-ff --no-commit "$SHA" \
+               -m "Merge upstream ${UPSTREAM_REPO} main ($SHA)" || true
+
+          # Record what the merge wanted to do to paths this fork owns, before it
+          # is undone. The report used to diff $OURS against the amended HEAD - a
+          # diff the pin had just emptied, so it never showed anything. This one
+          # is taken while the merged index is still live.
+          git diff --cached --name-status "$OURS" -- ${FORK_PATHS} > /tmp/pinned.txt || true
 
           # Fork paths win outright. rm first, then restore from the pre-merge
           # commit: `git checkout <c> -- <dir>` only writes paths that exist in
@@ -112,7 +128,22 @@ jobs:
             rm -rf "$p"
             git checkout "$OURS" -- "$p"
           done
-          git commit --amend --no-edit --no-verify
+          # Staging is what clears the conflict entries the pin just resolved.
+          git add -A -- ${FORK_PATHS}
+
+          # Anything still unmerged is a conflict inside upstream's own source.
+          # This fork edits none of that, so it is a real problem and must not be
+          # resolved by quietly taking one side.
+          if [ -n "$(git ls-files -u)" ]; then
+            echo "::error::Merge conflict in upstream-owned source. main is unchanged, nothing was pushed, and no image is blocked - basalt-image.yml merges upstream on its own."
+            git diff --name-only --diff-filter=U || true
+            git merge --abort || true
+            exit 1
+          fi
+
+          # A merge that pins back to nothing leaves nothing staged: the commit
+          # fails harmlessly and the HEAD comparison below reports changed=false.
+          git commit --no-edit --no-verify || true
 
           # The safety argument rests on this assertion. If it trips, the pin
           # failed and pushing would require the workflows scope - the scope this
@@ -123,8 +154,8 @@ jobs:
             exit 1
           fi
 
-          # What upstream did to the workflows this fork keeps out, for review.
-          git diff --stat "$OURS" HEAD -- .github > /tmp/pinned.txt 2>/dev/null || true
+          # /tmp/pinned.txt was written from the merged index above; the pin
+          # makes those same paths invisible to any diff taken from HEAD.
 
           if [ "$(git rev-parse HEAD)" = "$OURS" ]; then
             echo "changed=false" >> "$GITHUB_OUTPUT"
@@ -159,7 +190,7 @@ jobs:
             esac
             if [ -s /tmp/pinned.txt ]; then
               echo ""
-              echo "<details><summary>upstream changes under \`.github/\` that this fork pinned away</summary>"
+              echo "<details><summary>upstream changes to fork-owned paths, pinned away (A added, M modified, U collided)</summary>"
               echo ""
               echo '```'
               cat /tmp/pinned.txt
