@@ -44,11 +44,11 @@ public:
     struct Lookup {
         int k = 0;
         const uint8_t* dev[kMaxK] = {};    ///< device blob of an expert the VRAM tier holds, else null
-        const uint8_t* peer[kMaxK] = {};   ///< device blob of an expert the second card holds, else null
-        const uint8_t* host[kMaxK] = {};   ///< host blob of the others
+        const uint8_t* peer[kMaxK] = {};   ///< device blob of an expert the second card holds or fetched, else null
+        const uint8_t* host[kMaxK] = {};   ///< host blob of the others (and of those the second card fetched)
         int experts[kMaxK] = {};
         bool again[kMaxK] = {};            ///< a miss that repeats one from the last kPromoteWindow tokens
-        bool fetched[kMaxK] = {};          ///< `dev` is being copied in by `fetch`
+        bool fetched[kMaxK] = {};          ///< `dev` or `peer` is being copied in by `fetch`
     };
 
     /// The window rows that use one looked-up expert: row i of token tok[i] is `row[i]` of the output rows.
@@ -104,14 +104,17 @@ public:
     /// `main` (a layer's sum) they start behind, and pump issues up to `pieces` promotion pieces there (and at most
     /// policy::kPeerGapPieces exchange pieces on the second card's bus), after the next launches went out (the next
     /// layer's head; at the window's end, its output), so they do not take the host memory's bandwidth from the CPU's
-    /// share and the bus copies of a layer's misses. With `layer` >= 0 (called before the layer's lookup) that layer's
-    /// queued copies first go out whole and land.
+    /// share and the bus copies of a layer's misses. A copy queued after them on another stream (a layer's bus fetch)
+    /// waits for one piece at most. With `layer` >= 0 (called before the layer's lookup) that layer's queued copies first
+    /// go out whole and land.
     void mark_gap(cudaStream_t main);
     void pump(int layer, int pieces);
     static constexpr int kAllPieces = 1 << 20;
     /// Starts the bus copy of the pinned misses of `lk` beyond the CPU's half (policy::bus_count) into the VRAM tier; those
-    /// experts get a device blob in `lk`, marked `fetched`, so the GPU computes them while the CPU does the rest. How many
-    /// started; `await_fetch` makes `main` wait for them.
+    /// experts get a device blob in `lk`, marked `fetched`, so the GPU computes them while the CPU does the rest. With a
+    /// second card, policy::peer_bus_count of them cross its own link into its scratch slots instead (`peer`, marked
+    /// `fetched`); their VRAM tier copies follow off the token path. How many the main card's link started; `await_fetch`
+    /// makes `main` wait for them.
     int fetch(int layer, Lookup& lk);
     void await_fetch(cudaStream_t main);
     /// Queues the pinned misses the CPU computed that missed before within kPromoteWindow tokens for a copy into the
@@ -159,7 +162,8 @@ private:
         int layer, expert, slot, event;
         int out = -1, place = -1;
     };
-    /// A promotion whose copies wait for an idle bus: the home's bytes out to `home_to` first, then `src` into `dst`.
+    /// A promotion whose copies wait for an idle bus: the home's bytes out to `home_to` (on the out stream), then `src`
+    /// into `dst` once they are out.
     struct Queued {
         Pending p;
         uint8_t* dst;
@@ -229,10 +233,12 @@ private:
     std::vector<Queued> queue_;             ///< promotions not yet fully issued, oldest first
     std::vector<PeerMove> peer_moves_;      ///< second card exchanges not landed yet, oldest first
     std::vector<int32_t> peer_owner_;       ///< [second card slot] expert it holds or is receiving
-    std::vector<cudaEvent_t> events_;
+    std::vector<cudaEvent_t> events_;       ///< [event] behind a copy's last piece in
+    std::vector<cudaEvent_t> out_events_;   ///< [event] behind the last piece out of the home a promotion replaces
     std::vector<int> free_events_;
     int claims_ = 0;                        ///< copies claimed since the last begin_token (at most kMaxPending)
     cudaStream_t copy_stream_ = nullptr;    ///< promotions, off the token path
+    cudaStream_t out_stream_ = nullptr;     ///< the homes they replace, out to RAM beside them
     cudaStream_t fetch_stream_ = nullptr;   ///< copies a layer waits for (high priority)
     cudaEvent_t fetch_ev_ = nullptr;
     cudaEvent_t gap_ev_ = nullptr;          ///< the main stream's point the pumped pieces start behind
