@@ -3,7 +3,7 @@ cmake_minimum_required(VERSION 3.24)
 if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
   set(CMAKE_CUDA_ARCHITECTURES 120 CACHE STRING "CUDA architectures" FORCE)
 endif()
-project(basalt VERSION 0.3.2 LANGUAGES C CXX CUDA)
+project(basalt VERSION 0.3.3 LANGUAGES C CXX CUDA)
 add_compile_definitions(BASALT_VERSION="${PROJECT_VERSION}")
 
 set(CMAKE_CXX_STANDARD 20)
@@ -318,6 +318,7 @@ target_link_libraries(basalt-load PRIVATE core kernels)
 # reference is the whole point - a kernel checked against another copy of itself proves nothing.
 add_library(kernels STATIC src/kernels/cuda/quantize_act.cu
                         src/kernels/cuda/sampler.cu
+                        src/kernels/cuda/logprobs.cu
                         src/kernels/cuda/elementwise.cu
                         src/kernels/cuda/bf16_gemv.cu
                         src/kernels/cuda/native_mmvq.cu
@@ -571,6 +572,29 @@ if(BUILD_TESTING)
   add_executable(vision_resize_test tests/vision/preprocess_test.cpp)
   target_link_libraries(vision_resize_test PRIVATE vision_core warnings)
   basalt_cpu_test(NAME vision_resize_test COMMAND vision_resize_test)
+  # FFmpeg found at run time, or the reason it is not (any machine: CI has no FFmpeg)
+  add_executable(ffmpeg_load_test tests/vision/ffmpeg_load_test.cpp)
+  target_link_libraries(ffmpeg_load_test PRIVATE vision_core warnings)
+  basalt_embed_manifest(ffmpeg_load_test)
+  basalt_cpu_test(NAME ffmpeg_load_test COMMAND ffmpeg_load_test)
+  # video sampling, canvas, timestamps and patches against the reference processor; the committed clip is decoded
+  # where this machine has FFmpeg
+  add_executable(video_test tests/vision/video_test.cpp)
+  target_link_libraries(video_test PRIVATE vision_core warnings)
+  basalt_embed_manifest(video_test)
+  basalt_cpu_test(NAME video_test COMMAND video_test ${CMAKE_CURRENT_SOURCE_DIR}/tests/data/video/synth.mp4)
+  # a prompt's rotary positions with pictures and video groups against the reference's get_rope_index
+  add_executable(mrope_positions_test tests/vision/mrope_positions_test.cpp)
+  target_link_libraries(mrope_positions_test PRIVATE vision_core warnings)
+  basalt_cpu_test(NAME mrope_positions_test COMMAND mrope_positions_test)
+  # the hand-declared FFmpeg ABI against FFmpeg's own headers, where this machine has them (nothing is linked)
+  find_path(BASALT_FFMPEG_HEADERS libavformat/avformat.h)
+  if(BASALT_FFMPEG_HEADERS)
+    add_executable(ffmpeg_abi_test tests/vision/ffmpeg_abi_test.cpp)
+    target_include_directories(ffmpeg_abi_test PRIVATE include ${BASALT_FFMPEG_HEADERS})
+    basalt_cpu_test(NAME ffmpeg_abi_test COMMAND ffmpeg_abi_test)
+    set_tests_properties(ffmpeg_abi_test PROPERTIES SKIP_RETURN_CODE 77)
+  endif()
 endif()
 add_dependencies(basalt-bench basalt basalt-device git_stamp)
 target_include_directories(basalt-bench PRIVATE ${CMAKE_BINARY_DIR}/stamp)
@@ -862,6 +886,11 @@ target_include_directories(sampler_parity PRIVATE ${_gpu_include_directories})
 target_link_libraries(sampler_parity PRIVATE kernels ${_gpu_runtime_target})
 basalt_gpu_test(NAME sampler_parity COMMAND sampler_parity --selftest)
 basalt_gpu_test(NAME sampler_split_parity COMMAND sampler_parity --split)
+# a pick's log probability and the row's likeliest tokens (row_logprobs) against a double CPU reference
+add_executable(logprobs_parity tests/kernels/logprobs_parity.cpp)
+target_include_directories(logprobs_parity PRIVATE ${_gpu_include_directories})
+target_link_libraries(logprobs_parity PRIVATE kernels ${_gpu_runtime_target})
+basalt_gpu_test(NAME logprobs_parity COMMAND logprobs_parity)
 # the decode QSA top-k and the greedy argmax on thread-block clusters vs the one-CTA kernels, bitwise,
 # captured in a graph too (GPU, synthetic, no model; skips without cluster support); --bench: per-call times
 add_executable(decode_cluster_parity tests/models/qwen4exp/kernels/decode_cluster_parity.cpp)
@@ -1136,6 +1165,13 @@ target_link_libraries(reply_rows_test PRIVATE warnings)
 basalt_embed_manifest(reply_rows_test)
 basalt_cpu_test(NAME reply_rows_test COMMAND reply_rows_test)
 set_tests_properties(reply_rows_test PROPERTIES TIMEOUT 60)
+# a sent pick's log probability and the row's likeliest tokens (CPU only)
+add_executable(logprobs_test tests/program/logprobs_test.cpp)
+target_include_directories(logprobs_test PRIVATE src/program/serve include)
+target_link_libraries(logprobs_test PRIVATE warnings)
+basalt_embed_manifest(logprobs_test)
+basalt_cpu_test(NAME logprobs_test COMMAND logprobs_test)
+set_tests_properties(logprobs_test PROPERTIES TIMEOUT 60)
 # the lines the server reads from the engine: the conversation cache's figures and the context-overflow ERR
 add_executable(protocol_lines_test tests/program/protocol_lines_test.cpp)
 target_include_directories(protocol_lines_test PRIVATE include)
