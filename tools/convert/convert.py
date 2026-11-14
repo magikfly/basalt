@@ -8,6 +8,7 @@
         [--name NAME] [--workers N] [--force]
     python3 tools/convert/convert.py --sections-from DEEPSEEK.basalt --checkpoint DIR --out MODEL.basalt [--stream-shards] \\
         [--name NAME] [--workers N] [--force]
+    python3 tools/convert/convert.py --checkpoint QWEN35_DIR --out MODEL.basalt [--drafter DFLASH2_DIR] [--name NAME] [--workers N] [--force]
 
 Inputs
   --gguf FILE        the model's GGUF: shard 1 of a split model (the others are found beside it) or --gguf per shard
@@ -40,6 +41,13 @@ From NVIDIA's DeepSeek-V4.1 NVFP4 checkpoint (a deepseek41 BASE; tools/convert/c
                      reads BF16); the MXFP4 Engram rows are kept. Tokenizer, metadata, vision and drafter are BASE's
   --stream-shards    the shards may arrive while the conversion runs, in file order (another process downloads them), and
                      each is deleted once its tensors are written: the disk holds the pack and a shard or two
+
+From a dense qwen35 NVFP4 checkpoint (no --sections-from; tools/convert/checkpoint_qwen35.py)
+  --checkpoint DIR   NVIDIA Model Optimizer's checkpoint of a Qwen3.5-family dense model (nvidia/Qwen3.8-27B-NVFP4): the
+                     NVFP4 MLP and head keep their codes and scales, the FP8 projections become Q8_0 of their values, the
+                     drafter's BF16 projections Q8_0, the vision tower an mmproj GGUF; tokenizer and metadata from the
+                     checkpoint's files. Everything comes from DIR.
+  --drafter DIR      z-lab's DFlash 2 block drafter for the model (z-lab/Qwen3.8-27B-DFlash2), added as dflash.* tensors
 
 Dense requantization
     python3 tools/convert/convert.py --requant-dense-q6k PACK.basalt [--checkpoint DIR] --out MODEL.basalt [--workers N] [--force]
@@ -776,6 +784,8 @@ def main():
     ap.add_argument("--stream-shards", action="store_true",
                     help="with --checkpoint and a deepseek41 --sections-from: shards arrive in file order and are deleted once used")
     ap.add_argument("--workers", type=int, default=16, help="with --checkpoint: converter processes")
+    ap.add_argument("--drafter", metavar="DIR", help="with a qwen35 --checkpoint: a DFlash 2 block drafter (z-lab's "
+                    "DFlash2DraftModel safetensors and config.json) added as dflash.* tensors")
     ap.add_argument("--force", action="store_true", help="overwrite --out")
     ap.add_argument("--dry-run", action="store_true",
                     help="with --gguf: print every section's offset and size and write nothing")
@@ -803,6 +813,16 @@ def main():
         if a.mtp_dense and not Path(a.mtp_dense).is_file():
             ap.error(f"missing input: {a.mtp_dense}")
         from_checkpoint(a)
+        return
+    if a.checkpoint:
+        if a.gguf or a.mmproj or a.mtp_source or a.mtp_dense or a.draft_vocab or a.dense_q8_0 or a.stream_shards:
+            ap.error("--checkpoint without --sections-from takes only --out, --name, --drafter, --workers and --force")
+        if a.drafter and not Path(a.drafter).is_dir():
+            ap.error(f"missing input: {a.drafter}")
+        if not Path(a.checkpoint).is_dir():
+            ap.error(f"missing input: {a.checkpoint}")
+        import checkpoint_qwen35 as Q
+        Q.build(a, Job, fingerprint, die)
         return
     if a.dense_q8_0 or a.stream_shards:
         ap.error("--dense-q8-0 and --stream-shards need --checkpoint and --sections-from")

@@ -68,3 +68,39 @@ python3 tools/convert/convert.py --sections-from Qwen3.8-FN-UD-Q4_K_XL.basalt --
 
 `--mtp-dense FILE` (the `mtp/dense` bytes of an official NVFP4, UD-IQ1_M, UD-IQ2_XS or UD-IQ3_XXS pack) swaps in a tuned drafter layer; the converter
 records it in `meta.mtp.dense`. Output is about 122 GiB (123 GiB for the 8-bit variant). The base's vocabulary must be NVIDIA's.
+
+## Qwen3.8-27B pack
+
+From NVIDIA's checkpoint ([nvidia/Qwen3.8-27B-NVFP4](https://huggingface.co/nvidia/Qwen3.8-27B-NVFP4), revision `482ca0f3`)
+alone, no base pack: tokenizer, metadata, MTP layer and vision tower come from the checkpoint's own files. `--drafter` adds the
+DFlash 2 block drafter ([z-lab/Qwen3.8-27B-DFlash2](https://huggingface.co/z-lab/Qwen3.8-27B-DFlash2)).
+
+```sh
+hf download nvidia/Qwen3.8-27B-NVFP4 --revision 482ca0f3 --local-dir nvidia
+hf download z-lab/Qwen3.8-27B-DFlash2 --local-dir dflash2
+python3 tools/convert/convert.py --checkpoint nvidia --drafter dflash2 --out Qwen3.8-27B-NVFP4.basalt --name "Qwen3.8-27B NVFP4"
+```
+
+- `gguf`: every tensor in llama.cpp's `qwen35` names. NVFP4 MLP and head move bit for bit as `NVFP4_PLANES` (type 45, below)
+  with each matrix's FP32 scale as `<name>.scale`; the FP8 projections keep their E4M3 codes (type 44, `F8_E4M3`: one
+  byte per value, Basalt's own type id) with each matrix's FP32 `weight_scale` as `<name>.scale`; the MTP layer's and the
+  drafter's BF16 projections Q8_0; norms F32 with the offset folded in (exact); GDN value heads in the GGUF order (rows of
+  qkv and z, columns of the out projection, moved whole).
+- `vision/mmproj`: the BF16 tower written as llama.cpp's clip GGUF (`qwen3vl_merger`); `vision/text_vocab` beside it.
+- The drafter's feature projection is stored as one block per target layer (`dflash.fc.N`), so the engine projects each
+  layer's rows as the layer ends. About 20 GiB, 22 GiB with the drafter; two minutes on 8 converter processes. The engine
+  refuses a 27B pack whose MLP and head are NVFP4 in ggml blocks (type 40, before NVFP4_PLANES) and asks for a re-conversion.
+
+### `NVFP4_PLANES` (tensor type 45)
+
+An NVFP4 matrix of `rows` x `K` (rows a multiple of 128, K of 64) as two planes in one tensor, 36 bytes per 64 values like
+ggml's NVFP4 blocks, the layout the dense products read with TMA (NInfer's and Infernix's `block_scale_k16_m128x4`):
+
+- **Codes**, `rows * K / 2` bytes from the tensor's start: row-major, byte `b` of a row holds value `2b` in its low nibble and
+  `2b + 1` in its high nibble (E2M1, as NVIDIA's checkpoints store them).
+- **Scales**, `rows * K / 16` UE4M3 bytes right after the codes, one per 16 values: 512-byte tiles of 128 rows x 4 groups,
+  row-block major, so the scale of row `r` and group `g` (`= k / 16`) sits at
+  `((r / 128) * (K / 64) + g / 4) * 512 + (r % 32) * 16 + ((r % 128) / 32) * 4 + g % 4`.
+- The matrix's FP32 scale is a separate F32 [1] tensor `<name>.scale`; a value is `e2m1 * ue4m3 * scale`.
+
+[nvfp4_planes.hpp](../include/basalt/kernels/nvfp4_planes.hpp) is the engine's copy of this layout.

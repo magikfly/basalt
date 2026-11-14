@@ -1,0 +1,92 @@
+# Qwen3.8-27B precision
+
+What the dense stack computes in, where it rounds, and what that costs against the BF16 model. The method:
+[how quality is measured](quality.md).
+
+## Weights
+
+| Tensors | Stored as | From NVIDIA's checkpoint |
+| --- | --- | --- |
+| MLP gate, up, down; output head | NVFP4_PLANES (E2M1, UE4M3 per 16, FP32 per matrix) | bit for bit |
+| GDN qkv, z, out; attention q, k, v, o | F8_E4M3 (E4M3 codes, FP32 per matrix) | bit for bit |
+| GDN a, b; conv; norms | BF16, F32 | as stored (norms with the offset folded in, exact) |
+| Token embedding | BF16, in page-locked RAM | as stored |
+| MTP layer, block drafter | Q8_0 from BF16; the block drafter's projections rounded to NVFP4 at load (its conv stays Q8_0) | drafting only: cannot change output |
+
+## Where each stage rounds
+
+- **Products:** NVFP4 matrices (MLP, head): in decode windows each E2M1 code times its UE4M3 group scale is converted to bf16
+  exactly and multiplied by the window's bf16 rows on the bf16 tensor cores with fp32 accumulation; prompt chunks run
+  the MLP W4A4 on every chunk: each row rounded to FP4 (E2M1 with a UE4M3 scale per 16 values against a per-row FP32 scale,
+  amax / (6 x 448)) and multiplied on the FP4 tensor cores, fp32 accumulation. An NVFP4 matrix's FP32 scale is applied to
+  its fp32 output. F8_E4M3 projections: in prompt chunks the activations are
+  rounded to E4M3 once per row (scale amax / 448) and multiplied on FP8 tensor cores (W8A8, as NVIDIA's checkpoint
+  specifies; its static input_scale is not used); in decode windows the codes are converted to bf16 exactly and multiplied by
+  the window's bf16 rows with fp32 accumulation. Both apply the matrix's FP32 scale at the end.
+- **Decode windows:** a row's products are summed in K slices fixed by the matrix's shape and added in order, and the
+  attention splits a row's cells by position alone, so a token's arithmetic is the same in a drafted window and in plain
+  decoding: greedy output with drafting is bitwise plain greedy, alone or beside other slots. Tokens read through the
+  prompt path round differently from decoded ones, so this holds where every request reads the same prompt the same way. A
+  thinking budget stops the engine on its last token and the answer continues the engine's own state, so it holds there too.
+  When the server cuts off a thinking loop, the tokens the engine wrote past the cut are read again through the prompt path,
+  and that reply can differ in the last bits between runs.
+- **GDN:** fp32 state and conv history. Decode windows replay accepted rows into the state; prompt chunks run the chunked delta
+  rule with q/k in BF16 and the state in fp32 (shared with Flash-Next). The prompt's a/b projections (BF16 weights) take the
+  normed rows as two bf16 terms on tensor cores (about fp32's precision), the gates applied in the same kernel.
+- **Attention:** K and V stored fp16, or with `--kv int8` as int8 codes and an fp16 scale per 64 values (amax / 127, codes rounded
+  to nearest against the stored scale). Decode reads them with fp32 dot products and softmax (int8: code x scale in fp32), in chunks of 64 cells folded in a fixed
+  order.
+  Prompt chunks, fp16 cache: QK^T with fp16 q and k on tensor cores, fp32 accumulation; P V with fp16 p and v, each tile of
+  32 cells summed in fp16 and added to the fp32 output. int8 cache: q rounded to int8 per 64 values (amax / 127), each
+  64-value group's integer sum times both scales in fp32; P V in 8 bits (Infernix's prompt-pv8): per 64-value V group
+  each probability times its cell's fp16 scale, rounded to u8 against the row's largest product in the 64-cell tile
+  (255 = that maximum), times the stored V codes on the int8 tensor cores with exact int32 sums, scaled back into the
+  fp32 output; long prompts split the cells and merge the splits in fp32. Softmax in fp32. Measured against serial
+  decode (the prompt path vs the same prompt one token at a time, int8 KV, natural text): KL 0.059 at 16,023 tokens and
+  0.016 at 64,023, the same next token (one row each, BF16 activations in both paths). The gate's int8-KV row below reads
+  this path.
+- **Residual and norms:** prompt chunks keep the residual stream in BF16 (each add in fp32, rounded once) and pass BF16
+  activations between kernels (qkv, z, the conv output, q/k/v, the normed rows for GDN's a/b); norms and softmax in fp32.
+  Decode windows keep the residual in BF16 by the same rule (every add in fp32, rounded once, in the window gemm's epilogue),
+  and the products read BF16 rows that the producing kernels write.
+
+## Quality against BF16
+
+Reference: [quality](quality.md#the-bf16-reference). 100 chunks, 25,500 rows, one RTX 5090 at 400 W. The first two rows are
+the current build, with the BF16 residual and activations; the int8-KV row also reads the 8-bit P V. The last two were measured
+before both, with `--kv fp16`.
+
+| Pack | PPL | KLD mean | KLD median | KLD p99 | Top-1 |
+|---|---:|---:|---:|---:|---:|
+| NVFP4 + F8_E4M3 projections, the prompt MLP W4A4 on every chunk (the default), `--kv fp16` | 6.7843 | 0.0239 | 0.0128 | 0.209 | 92.52% |
+| The same, `--kv int8` | 6.7814 | 0.0240 | 0.0129 | 0.203 | 92.56% |
+| Before the BF16 residual: the prompt MLP on int8 below 1,024 rows (before NVFP4_PLANES) | 6.7850 | 0.0214 | 0.0118 | 0.179 | 92.87% |
+| Earlier pack: projections Q8_0 of the FP8 values, MLP int8 below 1,024 rows | 6.7889 | 0.0213 | 0.0118 | 0.178 | 92.93% |
+
+The F8 projections hold NVIDIA's values exactly but read prompt rows in E4M3 (one scale per row) where the Q8_0 pack read
+them in q8_1 (one scale per 32): perplexity 6.7889 -> 6.7850, KLD 0.0213 -> 0.0214, top-1 92.93 -> 92.87%.
+
+The base scores 6.7411 on the same rows. Each chunk's first half is read as one 257-row prompt and the scored rows are then
+decoded against it, so every scored row sees a cache and recurrent state the prompt path wrote. With the MLP in NVFP4 planes
+the prompt path runs it W4A4 at any chunk length (as NVIDIA's checkpoint and Infernix do); before, chunks under 1,024 rows
+took int8 activations, and the gate's 257-row reads never reached W4A4. That costs this gate KLD +0.0025 and top-1 -0.3
+points; long prompts were W4A4 already. Decode never uses it. (The first row was measured with W4A4 forced on the earlier
+F8 pack: the same arithmetic.)
+
+## Agreement with Hugging Face
+
+Four short prompts (5, 15, 21 and 60 tokens; the last a chat-templated question), every position's logits through the decode
+path against Hugging Face transformers' own Qwen3.5 modules run in fp32 on the CPU, with the same NVFP4 and FP8 weights
+dequantized (`basalt --diag-serial-prompt --diag-logits`):
+
+| Prompt | Positions | Top-1 agreement | Mean KL | Max KL |
+| --- | --- | --- | --- | --- |
+| 0 | 5 | 5 of 5 | 0.0001 | 0.0001 |
+| 1 | 15 | 15 of 15 | < 0.0001 | 0.0001 |
+| 2 | 21 | 21 of 21 | < 0.0001 | 0.0002 |
+| 3 (chat) | 60 | 59 of 60 | 0.0010 | 0.013 |
+
+The prompt path's last position has the same top-1 on all four, KL at most 0.001 on the plain text and 0.11 on the chat
+prompt, where the prompt MLP reads its rows in FP4. For scale, the same reference run on the BF16
+model against the NVFP4 weights: 91 of 101 top-1, mean KL 0.01 on plain text and 0.18 on the chat prompt: the checkpoint's
+quantization, not the engine.
