@@ -34,6 +34,7 @@ public:
         if (st_.join) cudaEventDestroy(st_.join);
         if (done_) cudaEventDestroy(done_);
         if (h_picks_) cudaFreeHost(h_picks_);
+        if (st_.far_host) cudaFreeHost(st_.far_host);
     }
 
     bool init(std::string& err) {
@@ -53,10 +54,10 @@ public:
             block_bytes = bd.layers.size() * 2 * (size_t) (bd.window + 256) * bd.n_kv * bd.head_dim * 2 +
                           (size_t) kWindow * (g.n_embd * 4 + 16) + 64 * 256;
         }
-        if (!st_.arena.reserve(session_bytes(g, m_.o.max_context, drafter_, m_.o.kv_int8) + block_bytes)) {
+        const uint64_t dev_bytes = session_bytes(g, m_.o.max_context, drafter_, m_.o.kv_int8, m_.o.kv_resident);
+        if (!st_.arena.reserve(dev_bytes + block_bytes)) {
             err = m_.o.arch + ": out of device memory for a session of " + std::to_string((long long) m_.o.max_context) +
-                  " cells (" + std::to_string((unsigned long long) (session_bytes(g, m_.o.max_context, drafter_, m_.o.kv_int8) >> 20)) +
-                  " MiB); lower --max-context or --parallel";
+                  " cells (" + std::to_string((unsigned long long) (dev_bytes >> 20)) + " MiB); lower --max-context or --parallel";
             return false;
         }
         const size_t C = (size_t) g.conv_channels(), HV = (size_t) g.gdn_v_heads;
@@ -71,13 +72,45 @@ public:
             st_.rec_beta = st_.arena.take<float>(ng * kWindow * HV);
         }
         const size_t cells = (size_t) m_.o.max_context * g.n_kv * g.head_dim;
+        // with K/V streaming each layer keeps its first `near` cells here and the rest in page-locked host memory
+        const int64_t near_cells = resident_cells(m_.o.max_context, m_.o.kv_resident);
+        const size_t n_near = (size_t) near_cells * g.n_kv * g.head_dim, n_far = cells - n_near;
+        uint8_t* host = nullptr;
+        if (n_far > 0 && g.attn_layers() > 0) {
+            const uint64_t hb = session_host_bytes(g, m_.o.max_context, m_.o.kv_int8, m_.o.kv_resident);
+            if (cudaHostAlloc(&st_.far_host, hb, cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess) {
+                cudaGetLastError();
+                st_.far_host = nullptr;
+                err = m_.o.arch + ": out of page-locked memory for the streamed K/V (" + std::to_string((unsigned long long) (hb >> 20)) +
+                      " MiB); raise --kv-resident or lower --max-context or --parallel";
+                return false;
+            }
+            host = (uint8_t*) st_.far_host;
+        }
+        // the far cells of one layer, carved from the host block (device-mapped: the same address on the card)
+        const auto far_view = [&](kernels::KvFar& f) {
+            f.at = near_cells;
+            if (m_.o.kv_int8) {
+                f.q8.k = (int8_t*) host;
+                f.q8.v = f.q8.k + n_far;
+                f.q8.ks = (uint16_t*) (f.q8.v + n_far);
+                f.q8.vs = f.q8.ks + n_far / 64;
+                host = (uint8_t*) (f.q8.vs + n_far / 64);
+            } else {
+                f.k = (uint16_t*) host;
+                f.v = f.k + n_far;
+                host = (uint8_t*) (f.v + n_far);
+            }
+        };
         for (int i = 0; i < g.attn_layers(); ++i) {
             kernels::KvInt8 q8;
+            st_.far_kv.emplace_back();
+            if (n_far > 0) far_view(st_.far_kv.back());
             if (m_.o.kv_int8) {
-                q8.k = st_.arena.take<int8_t>(cells);
-                q8.v = st_.arena.take<int8_t>(cells);
-                q8.ks = st_.arena.take<uint16_t>(cells / 64);
-                q8.vs = st_.arena.take<uint16_t>(cells / 64);
+                q8.k = st_.arena.take<int8_t>(n_near);
+                q8.v = st_.arena.take<int8_t>(n_near);
+                q8.ks = st_.arena.take<uint16_t>(n_near / 64);
+                q8.vs = st_.arena.take<uint16_t>(n_near / 64);
                 st_.kc.push_back(nullptr);
                 st_.vc.push_back(nullptr);
                 if (!q8.vs) {
@@ -85,8 +118,8 @@ public:
                     return false;
                 }
             } else {
-                st_.kc.push_back(st_.arena.take<uint16_t>(cells));
-                st_.vc.push_back(st_.arena.take<uint16_t>(cells));
+                st_.kc.push_back(st_.arena.take<uint16_t>(n_near));
+                st_.vc.push_back(st_.arena.take<uint16_t>(n_near));
             }
             st_.kq.push_back(q8);
         }
@@ -114,6 +147,8 @@ public:
             st_.dacc = st_.arena.take<float>((size_t) kWindow * g.n_embd);
             st_.dids = st_.arena.take<int32_t>(kWindow);
             st_.dconf = st_.arena.take<float>(kWindow);
+            st_.dq_ids = st_.arena.take<int32_t>((size_t) kWindow * kDraftQ);
+            st_.dq_p = st_.arena.take<float>((size_t) kWindow * kDraftQ);
             st_.win_tok = st_.arena.take<int32_t>(kWindow);
             if (!st_.win_tok) {
                 err = m_.o.arch + ": the block drafter's buffers do not fit the session's arena";
@@ -161,13 +196,13 @@ public:
             } join{*this};
             if (Result s = settle(pos, true); !s.ok()) return s;
             std::string err;
-            // a wide block drafts the whole window whatever was asked: its drafts cost about one pass at any count, and
-            // the policy picks the window from their chances
+            // a block's drafts cost about one pass at any count, so it offers all of them whatever was asked (a wide
+            // block the whole window) and the policy picks the window from their chances
             n = wide_ ? max_window() - 1 : std::clamp(n, 1, max_window() - 1);
             const int width = block_width(n);
             if (pos + width > m_.o.max_context) return fail(m_.o.arch + ": no room for a draft block");
             if (!block_draft(m_, st_, anchor, pos, width, err)) return fail(err);
-            n_draft_ = std::min(n, width - 1);
+            n_draft_ = std::min(width - 1, max_window() - 1);
             return {};
         }
         if (!drafter_) return {Status::NotImplemented, m_.o.arch + ": no drafter is loaded"};
@@ -210,9 +245,10 @@ public:
         std::string err;
         // the blocks in passes of at most a batch window's rows, in order
         std::vector<int> nn((size_t) count), width((size_t) count);
+        // a slot's next window shares the batch's rows: no more drafts than its share takes
+        const int share = std::max(1, std::min(max_window(), kBatch / count) - 1);
         for (int i = 0; i < count; ++i) {
-            // a slot's next window shares the batch's rows: no more drafts than its share takes
-            nn[(size_t) i] = std::clamp(n[i], 1, std::max(1, std::min(max_window(), kBatch / count) - 1));
+            nn[(size_t) i] = std::clamp(n[i], 1, share);
             width[(size_t) i] = ss[(size_t) i]->block_width(nn[(size_t) i]);
             if (pos[i] + width[(size_t) i] > m_.o.max_context) return fail(m_.o.arch + ": no room for a draft block");
         }
@@ -226,7 +262,7 @@ public:
         cudaEventRecord(done_, s0);
         for (int i = 1; i < count; ++i) cudaStreamWaitEvent(sts[(size_t) i]->stream, done_, 0);
         for (int i = 0; i < count; ++i) ss[(size_t) i]->join_commit();   // the sessions' commits ran side by side
-        for (int i = 0; i < count; ++i) ss[(size_t) i]->n_draft_ = std::min(nn[(size_t) i], width[(size_t) i] - 1);
+        for (int i = 0; i < count; ++i) ss[(size_t) i]->n_draft_ = std::min(share, width[(size_t) i] - 1);   // all the block's, as solo
         return {};
     }
 
@@ -342,6 +378,11 @@ public:
     Result prefill_chunk(const model::PrefillRequest& r) override {
         if (r.pos + r.n_tokens > m_.o.max_context) return fail(m_.o.arch + ": the prompt passes the context");
         if (Result s = settle(r.pos); !s.ok()) return s;
+        if (m_.line) {   // a long prompt across the cards
+            std::string err;
+            if (prompt_line_read(*m_.line, m_, st_, r.tokens, r.n_tokens, r.pos, r.progress, r.stop, err)) return {};
+            if (!err.empty()) return fail(err);
+        }
         std::vector<int32_t> pos3;
         for (int at = 0; at < r.n_tokens;) {
             const int n = std::min(kChunk, r.n_tokens - at);
@@ -472,10 +513,13 @@ public:
     Result save_cells(std::vector<core::ConversationKv>& kv, int64_t positions) override {
         cudaStreamSynchronize(st_.stream);
         kv.clear();
-        const auto down = [&](const void* dev, core::ConversationBuffer& to, size_t bytes) {
+        // a layer's array: its first `split` bytes on the card (`dev`), the rest streamed (`far`, host memory)
+        const auto down = [&](const void* dev, const void* far_buf, size_t split, core::ConversationBuffer& to, size_t bytes) {
             to.resize_for_overwrite(bytes);
             return to.visit(0, to.size(), [&](uint8_t* p, size_t n, size_t at) {
-                return cudaMemcpy(p, (const uint8_t*) dev + at, n, cudaMemcpyDeviceToHost) == cudaSuccess;
+                const size_t a = at < split ? std::min(n, split - at) : 0;
+                return (a == 0 || cudaMemcpy(p, (const uint8_t*) dev + at, a, cudaMemcpyDeviceToHost) == cudaSuccess) &&
+                       (a == n || cudaMemcpy(p + a, (const uint8_t*) far_buf + (at + a - split), n - a, cudaMemcpyDefault) == cudaSuccess);
             });
         };
         for (size_t i = 0; i < st_.kc.size() + (drafter_ ? 1 : 0); ++i) {
@@ -488,12 +532,15 @@ public:
             k.head_dim = g_.head_dim;
             k.page_size = 1;
             const size_t rows = (size_t) positions * row_bytes(int8);
+            const kernels::KvFar f = mtp ? kernels::KvFar{} : st_.far_kv[i];
+            const size_t split = (size_t) std::min<int64_t>(f.at, positions) * row_bytes(int8);
             bool ok;
             if (int8) {
                 const kernels::KvInt8& q = st_.kq[i];
-                ok = down(q.k, k.k, rows) && down(q.v, k.v, rows) && down(q.ks, k.k_scale, rows / 32) && down(q.vs, k.v_scale, rows / 32);
+                ok = down(q.k, f.q8.k, split, k.k, rows) && down(q.v, f.q8.v, split, k.v, rows) &&
+                     down(q.ks, f.q8.ks, split / 32, k.k_scale, rows / 32) && down(q.vs, f.q8.vs, split / 32, k.v_scale, rows / 32);
             } else {
-                ok = down(mtp ? st_.mtp_kc : st_.kc[i], k.k, rows) && down(mtp ? st_.mtp_vc : st_.vc[i], k.v, rows);
+                ok = down(mtp ? st_.mtp_kc : st_.kc[i], f.k, split, k.k, rows) && down(mtp ? st_.mtp_vc : st_.vc[i], f.v, split, k.v, rows);
             }
             if (!ok) return fail("reading the KV cells back failed");
             kv.push_back(std::move(k));
@@ -505,9 +552,11 @@ public:
         cudaStreamSynchronize(st_.stream);
         if (kv.size() != st_.kc.size() + (drafter_ ? 1 : 0)) return fail(m_.o.arch + ": a parked conversation has other caches");
         if (positions > m_.o.max_context) return fail(m_.o.arch + ": a parked conversation is longer than the context");
-        const auto up = [&](void* dev, const core::ConversationBuffer& from, size_t bytes) {
+        const auto up = [&](void* dev, void* far_buf, size_t split, const core::ConversationBuffer& from, size_t bytes) {
             return from.size() >= bytes && from.visit(0, bytes, [&](const uint8_t* p, size_t n, size_t at) {
-                return cudaMemcpy((uint8_t*) dev + at, p, n, cudaMemcpyHostToDevice) == cudaSuccess;
+                const size_t a = at < split ? std::min(n, split - at) : 0;
+                return (a == 0 || cudaMemcpy((uint8_t*) dev + at, p, a, cudaMemcpyHostToDevice) == cudaSuccess) &&
+                       (a == n || cudaMemcpy((uint8_t*) far_buf + (at + a - split), p + a, n - a, cudaMemcpyDefault) == cudaSuccess);
             });
         };
         for (size_t i = 0; i < kv.size(); ++i) {
@@ -517,12 +566,15 @@ public:
             if (k.format != (int8 ? 2 : 1) || k.heads != g_.n_kv || k.head_dim != g_.head_dim)
                 return fail(m_.o.arch + ": a parked conversation has other caches");
             const size_t rows = (size_t) positions * row_bytes(int8);
+            const kernels::KvFar f = mtp ? kernels::KvFar{} : st_.far_kv[i];
+            const size_t split = (size_t) std::min<int64_t>(f.at, positions) * row_bytes(int8);
             bool ok;
             if (int8) {
                 const kernels::KvInt8& q = st_.kq[i];
-                ok = up(q.k, k.k, rows) && up(q.v, k.v, rows) && up(q.ks, k.k_scale, rows / 32) && up(q.vs, k.v_scale, rows / 32);
+                ok = up(q.k, f.q8.k, split, k.k, rows) && up(q.v, f.q8.v, split, k.v, rows) &&
+                     up(q.ks, f.q8.ks, split / 32, k.k_scale, rows / 32) && up(q.vs, f.q8.vs, split / 32, k.v_scale, rows / 32);
             } else {
-                ok = up(mtp ? st_.mtp_kc : st_.kc[i], k.k, rows) && up(mtp ? st_.mtp_vc : st_.vc[i], k.v, rows);
+                ok = up(mtp ? st_.mtp_kc : st_.kc[i], f.k, split, k.k, rows) && up(mtp ? st_.mtp_vc : st_.vc[i], f.v, split, k.v, rows);
             }
             if (!ok) return fail(m_.o.arch + ": a parked conversation has other caches");
         }
@@ -544,6 +596,7 @@ public:
         kernels::SamplerParams sp = sampling_;
         sp.logit_bias = d_mask_;
         sp.counter += (uint64_t) row;
+        sp.n_drawn = 0;   // the row is drawn again under the mask, whatever its draft was
         kernels::sample_tokens(st_.logits + (size_t) row * g_.n_vocab, 1, g_.n_vocab,
                                history_len_ > 0 ? d_hist_ + (size_t) row * history_len_ : nullptr, history_len_, sp,
                                st_.picks, st_.stream);
@@ -677,10 +730,25 @@ private:
         if (r.sampling != nullptr) sampling_ = *r.sampling;
         sampling_.logit_bias = bias_on_ ? d_bias_ : nullptr;
         history_len_ = r.history != nullptr ? r.history_len : 0;
-        if (!sampling_.greedy && kernels::sampler_list_len(sampling_.top_k, g_.n_vocab) > kernels::kSamplerNarrowMax &&
-            !kernels::sampler_wide_reserve(g_.n_vocab, st_.stream)) {
+        const bool sampled = !sampling_.greedy && sampling_.temperature > 0.0f;
+        const bool narrow = kernels::sampler_list_len(sampling_.top_k, g_.n_vocab) <= kernels::kSamplerNarrowMax;
+        if (sampled && !narrow && !kernels::sampler_wide_reserve(g_.n_vocab, st_.stream)) {
             err = "out of device memory for the sampler";
             return false;
+        }
+        // Speculative sampling: on the narrow lists the block drafter draws its drafts from its own distribution and a
+        // window of them keeps each by min(1, p / q), else draws the residual (sampler.hpp): the tokens are distributed as
+        // the model's, and a drafter that spreads its guesses like the model keeps more of them than its best guesses would.
+        // Greedy requests, the wide lists and a request with its own seed keep the drafter's best candidates and the
+        // plain draws.
+        st_.dtemp = block_ && sampled && narrow && sampling_.draw_drafts ? sampling_.temperature : 0.0f;
+        st_.dseed = sampling_.seed;
+        if (r.drawn_drafts && st_.dtemp > 0.0f && r.n_tokens > 1) {
+            sampling_.drafts = st_.dids;
+            sampling_.q_ids = st_.dq_ids;
+            sampling_.q_p = st_.dq_p;
+            sampling_.q_n = m_.w.dflash.top_k;
+            sampling_.n_drawn = r.n_tokens - 1;
         }
         if (history_len_ > 0) {
             if (history_len_ > kHistoryCap) history_len_ = kHistoryCap;

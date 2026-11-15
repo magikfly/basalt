@@ -25,8 +25,9 @@ constexpr int32_t kEmbeddingsMagic = 0x31455653;
 class SessionRuntime;
 struct SlotWin;
 
-/// The drafts to make for the next window: up to one more than the window just verified used (at least 2), so a long
-/// window grows a row at a time where its drafts pay and the drafter's head runs only the rows a window can take.
+/// The drafts to ask for the next window: up to one more than the window just verified used (at least 2), so a chained
+/// drafter's long window grows a row at a time where its drafts pay.  A block drafter makes its whole block in one pass and
+/// offers every draft of it; the drafts read back are as many as the session made.
 int drafts_ahead(int T, int most) { return std::clamp(std::max(T, 2), 1, most - 1); }
 
 /// A picture's (or a video group's) embedding rows, placed at prompt position `at`, and its grid.
@@ -60,7 +61,8 @@ public:
         conversations.emplace((size_t) o.conversation_cache_mib << 20, (size_t) o.conversation_cache_slots);
         if (o.conversation_cache_disk_mib > 0) {
             const auto t0 = Clock::now();
-            const std::string text = "basalt conversation state " + model_.desc().arch + " vision_in_engine " + (o.vision_in_engine ? "1" : "0");
+            std::string text = "basalt conversation state " + model_.desc().arch + " vision_in_engine " + (o.vision_in_engine ? "1" : "0");
+            if (const std::string rope = basalt::model::rope_flag_words(o.rope); !rope.empty()) text += " " + rope;
             const uint64_t identity = basalt::core::conversation_store_hash_file(
                 o.model, basalt::core::conversation_store_hash(text.data(), text.size(), 1));
             std::string de;
@@ -430,6 +432,7 @@ public:
     }
     void fill_drafts(int T, bool from_sfx) {
         for (int i = 1; i < T; ++i) window[(size_t) i] = from_sfx ? sbuf_[(size_t) i - 1] : drafts_[(size_t) i - 1];
+        own_drafts_ = !from_sfx;
     }
     int before_window(int, int64_t) { return 0; }
     int32_t* history_stage() {
@@ -438,11 +441,12 @@ public:
     }
     void upload_history(int) {}
     void mark_before_run() {}
-    bool run_window(int T, int, int&) {
+    bool run_window(int T, int e0, int&) {
         basalt::model::DecodeRequest d;
         d.tokens = window.data();
         d.n_tokens = T;
         d.pos = p;
+        d.drawn_drafts = own_drafts_ && e0 == 0 && ppl == nullptr && T > 1;
         (T > 1 ? d.row_tokens : d.next_token) = outv.data();
         d.sampling = &req_sp;
         d.history = hist_n > 0 ? history_.data() : nullptr;
@@ -604,6 +608,7 @@ private:
     std::vector<Block> blocks_;
     std::vector<int32_t> history_;
     uint64_t draws_ = 0;
+    bool own_drafts_ = false;   // the window's drafts are the drafter's (fill_drafts), not a lookup proposal
     std::vector<int32_t> drafts_, sbuf_;
     std::vector<float> conf_, window_conf_;
     int n_draft_ = 0;
@@ -662,6 +667,7 @@ void SessionRuntime::slot_window_begin(int b, SlotWin& w, int limit) {
     w.d.pos = sl.p;
     (T > 1 ? w.d.row_tokens : w.d.next_token) = w.out.data();
     w.d.sampling = &sp;
+    w.d.drawn_drafts = !w.from_sfx && T > 1;
     if (sl.pen_n > 0) {
         w.history.resize((size_t) T * sl.pen_n);
         basalt::kernels::penalty_rows(sl.ids.data(), (int64_t) sl.ids.size(), w.win.data(), T, sl.pen_n, w.history.data());
@@ -761,7 +767,7 @@ bool SessionRuntime::slot_window_end(int b, SlotWin& w) {
     basalt::protocol::emit_text(w.line + "\n");
     basalt::core::progress_beat();
     if (w.drafting) {
-        const int max_n = std::min(drafts_ahead(T, session().max_window()), (int) std::size(sl.dr));
+        const int max_n = std::min(session().max_window() - 1, (int) std::size(sl.dr));
         if (const basalt::model::Result r = session().draft_end(sl.dr, sl.dprob, max_n, sl.n_dr); !r.ok()) return failed(r.message);
         const double ms = std::chrono::duration<double, std::milli>(Clock::now() - w.round0).count();
         if (w.from_sfx) bpolicy->observe(true, T, a, w.match, ms);

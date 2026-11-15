@@ -7,6 +7,7 @@
 
 #include <cuda_runtime.h>
 
+#include <functional>
 #include <memory>
 #include <string>
 #include <utility>
@@ -22,6 +23,7 @@ namespace basalt::dense {
 constexpr int kWindow = 16;       // rows one session's decode window holds
 constexpr int kBatch = 16;        // rows a batch window (several sessions' windows) holds
 constexpr int kNarrow = 8;        // the narrower MMQ tile for windows of up to 8 rows
+constexpr int kDraftQ = 20;       // candidates a block drafter's position keeps at most (its selector's top_k)
 constexpr int64_t kDraftVocab = 131072;   // vocabulary rows the block drafter's head scores (a multiple of 128)
 constexpr int kChunk = 4096;      // tokens a prompt chunk reads at once
 constexpr int kAttnSplits = 3;    // key splits the prompt attention may use: the most its plan picks for a full chunk
@@ -93,13 +95,20 @@ struct ChunkScratch {
     float *g = nullptr, *u = nullptr, *h = nullptr;
     float *hn = nullptr, *cat = nullptr;          // the drafter's history: main's normed rows, its input rows
     float* dacc = nullptr;                        // the block drafter's projected features of the chunk's rows
-    void* a4 = nullptr;                           // the MLP's FP4 activations (fp4_dense), their token scales
+    void* a4 = nullptr;                           // the FP4 activations (fp4_dense), their token scales
     float* gs = nullptr;
     float* hmax = nullptr;                        // each row's largest |H| (the SwiGLU product's), for its FP4 rounding
     int32_t *tok = nullptr, *pos = nullptr, *iota = nullptr, *bounds = nullptr;
 };
 
 struct SessionState;
+/// The prompt line: a second card that holds the last layers' weights and reads them for a long prompt's chunks while the
+/// main card reads the next chunk's first layers (prompt_line.cpp).
+class PromptLine;
+struct PromptLineDeleter {
+    void operator()(PromptLine* p) const;
+};
+using PromptLinePtr = std::unique_ptr<PromptLine, PromptLineDeleter>;
 
 class Model {
 public:
@@ -110,6 +119,11 @@ public:
     WindowScratch ws;
     ChunkScratch cs;
     bool chunk_ready = false;
+    // K/V streaming: the VRAM copy of one attention layer's far cells a prompt chunk reads (at = the resident cells; at
+    // INT64_MAX without streaming), filled on stage_side from stage_free (the stage's last reader done) to stage_ready
+    kernels::KvFar stage;
+    cudaStream_t stage_side = nullptr;
+    cudaEvent_t stage_free = nullptr, stage_ready = nullptr;
     std::unique_ptr<prefill::mmq::Context> mmq;
     std::vector<int> gdn_index, attn_index;      // per layer: its index among the GDN or attention layers (-1)
     // the batch windows' graphs, one per composition (the sessions in the window and their rows), the least recently used out
@@ -131,6 +145,7 @@ public:
     std::vector<void*> owned;                    // device buffers the model allocated (Q8 plane copies, a wider workspace)
     void* enc_arena = nullptr;
     size_t enc_bytes = 0;
+    PromptLinePtr line;                          // a second card reading long prompts' last layers (null: none)
     ~Model();
     bool ensure_chunk(std::string& err);
     /// llama.cpp's MMQ readied for every product of the model (its kernels loaded for each format and height).
@@ -157,6 +172,10 @@ struct SessionState {
     size_t gdn_floats = 0;                       // per layer
     std::vector<uint16_t*> kc, vc;               // per attention layer: [cell][n_kv][head_dim] fp16 (null with int8)
     std::vector<kernels::KvInt8> kq;             // per attention layer: the int8 cache ({} with fp16)
+    // per attention layer, with K/V streaming: the cells from Options::kv_resident on, in page-locked host memory
+    // (device-mapped); {} without.  kc/vc/kq then hold only the first kv_resident cells
+    std::vector<kernels::KvFar> far_kv;
+    void* far_host = nullptr;
     // the last window's rows per GDN layer, until its commit
     float *rec_qkv = nullptr, *rec_h = nullptr, *rec_gate = nullptr, *rec_beta = nullptr;
     int32_t* n_keep = nullptr;                   // device
@@ -172,12 +191,17 @@ struct SessionState {
     int32_t* win_tok = nullptr;                  // the last window's tokens (device)
     int64_t tail_cell = -1;
     // the block drafter: its context K/V per layer (cyclic, dctx_cap cells), the last window's projected features,
-    // its picks and their confidence
+    // its picks and their confidence, and the proposal each pick came from ([kWindow][top_k] candidates and their q)
     std::vector<uint16_t*> dk, dv;
     int64_t dctx_cap = 0, dctx_from = 0;         // cells; the first position its context holds
     float* dacc = nullptr;
     int32_t* dids = nullptr;
     float* dconf = nullptr;
+    int32_t* dq_ids = nullptr;
+    float* dq_p = nullptr;
+    // how the block drafter picks (temperature 0: its best candidates; above, drawn), set by the request's sampling
+    float dtemp = 0.0f;
+    uint64_t dseed = 0;
 };
 
 /// Runs a decode window of T rows at cells pos..pos+T-1 (`pos3` [T][3] their rope positions); leaves the logits in
@@ -196,6 +220,31 @@ bool forward_batch(Model& m, const BatchSeg* segs, int S, const int32_t* tokens,
 /// Runs a prompt chunk; rows are token embeddings, or `rows` (fp32 [T][n_embd]) when given.  `pos3` [T][3].
 bool forward_chunk(Model& m, SessionState& st, const int32_t* tokens, const float* rows, int T, int64_t pos,
                    const int32_t* pos3, std::string& err);
+/// A prompt chunk in phases (forward_chunk runs them in turn).  chunk_start: the bounds (host [2], null: {0, T}) and
+/// positions, then the input rows into the BF16 residual (token embeddings, or `rows`; neither: the caller places it).
+void chunk_start(Model& m, SessionState& st, const int32_t* tokens, const float* rows, int T, const int32_t* pos3,
+                 const int32_t* bounds = nullptr);
+/// Layers [l0, l1) of the chunk in m.cs; with `taps`, the block drafter's features of its target layers in the range
+/// into cs.dacc (the first target layer's written, the later ones' added).  The last layer's rows are made in full when
+/// something reads them (`read_last`, a drafter), else only its cells.
+void chunk_layers(Model& m, SessionState& st, int T, int64_t pos, int l0, int l1, const BlockDrafter* taps, bool read_last = false);
+/// The block drafter's feature projection j of the rows in cs.x into cs.dacc (j == 0 writes it, later ones add).
+void chunk_tap(Model& m, SessionState& st, int T, const BlockDrafter& taps, size_t j);
+/// After the last layer: the block drafter's context from cs.dacc, or the MTP history.
+bool chunk_finish(Model& m, SessionState& st, int T, int64_t pos, std::string& err);
+/// The block drafter's context cells at positions pos .. pos + n - 1 from n rows of features `dacc` (device).
+void block_ctx_chunk(Model& m, SessionState& st, const float* dacc, int n, int64_t pos);
+
+/// The line on CUDA device `dev` with layers [l_min, n_layers) of `w` (their weights already on `dev`, the other layers
+/// empty); both cards' prompt rates are timed here.
+PromptLinePtr make_prompt_line(Model& main, int dev, int l_min, const Weights& w, std::string& err);
+/// Reads tokens [pos, pos + n) of the session `st` (of model `main`) across the cards when the rates price that cheaper,
+/// true; false with empty `err` when it does not (the caller reads them on the main card).
+/// `stop` is asked between chunks on both cards: true ends the read where it is (the session then holds a part of the prompt
+/// only, as after a stopped read on the main card), true returned.
+bool prompt_line_read(PromptLine& line, Model& main, SessionState& st, const int32_t* tokens, int n, int64_t pos,
+                      const std::function<void(int)>& progress, const std::function<bool()>& stop, std::string& err);
+
 /// The commit of the last window's first n rows into the recurrent state.
 void commit_window(Model& m, SessionState& st, int n, cudaStream_t s);
 

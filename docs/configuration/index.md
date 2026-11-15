@@ -30,7 +30,7 @@ A config file is one JSON object. `models` lists the models; `engine` applies to
   `engine` (an engine flag) the same places, `model entry` a model entry only.
 - Keys are flag names without dashes. Switches are `true`. A repeatable option (`allowed-host`, `cors-origin`, `image-url-host`,
   `image-dir`) takes a list. `model` paths are relative to the file.
-- A row marked Flash-Next only or DeepSeek only stops the start in a model entry or on the command line of the other model; in the top-level `engine` it is left out for that model, with a start line ([checks at start](models.md#checks-at-start)).
+- A row that names its models (Flash-Next only, DeepSeek only, ...) stops the start in a model entry or on the command line of another model; in the top-level `engine` it is left out for that model, with a start line ([checks at start](models.md#checks-at-start)).
 - Precedence: command line, then config file, then defaults; `--model` and `--alias` do not go with `--config` (its entries name the models).
   A wrong block or an unknown name stops the start. `api-key` cannot be in a file.
 - The defaults are the fastest settings that need no knowledge of the machine. The keys that change output or memory (8,192 context,
@@ -72,6 +72,7 @@ Command line `--name`; the Where column says which config block takes it.
 | `debug` | server | switch | off | One log line per request, and the raw model text. |
 | `request-lines` | server | switch | off | Echo the per-request summary on stdout. |
 | `temperature`, `top-p`, `top-k`, `min-p`, `presence-penalty`, `frequency-penalty`, `repetition-penalty`, `penalty-last-n`, `seed` | entry | number (`top-k`, `penalty-last-n`, `seed`: integer) | the model file's `sampling`, else the engine's | Default for a request that leaves the field out. See [sampling](sampling.md). |
+| `reasoning-effort` | entry | `none`, `low`, `medium`, `high`, `xhigh` or `max` | unset (the template's default) | Reasoning effort for requests that name no effort, thinking switch or budget. See [sampling](sampling.md). |
 | `reasoning-budget-tokens` | entry | integer | `0` | Thinking budget for requests that name none. A request's own value wins. |
 | `thinking-loop-tokens` | entry | integer | `256` | End thinking when one token repeats this many times in a row; `0` turns it off. |
 | `answer-room` | entry | `auto` or integer | `auto` | Output tokens kept for closing the thinking and the answer: `auto`, or a fixed number (`0`: none). See [sampling](sampling.md#thinking). |
@@ -90,11 +91,11 @@ Command line `--name`; the Where column says which config block takes it.
 | --- | --- | --- | --- | --- |
 | `max-context` | engine | tokens | 8192 | Longest context. Shared by `parallel` slots. The KV cache grows with it. |
 | `kv` | engine | Flash-Next: `fp16`, `int8`, `q4_0`, `k8v4`; DeepSeek: `fp8`, `fp16`; Qwen3.8-27B: `fp16`, `int8` | Flash-Next `fp16`, DeepSeek `fp8`, Qwen3.8-27B `fp16` | KV storage. Qwen3.8-27B: `int8` takes about half of `fp16`'s memory per position ([guide](../models/qwen38-27b.md#memory)). Flash-Next: `int8` halves VRAM; `q4_0` is 4-bit after rotation; `k8v4` keeps K int8 and V 4-bit (816 bytes per cell against `int8`'s 1,056); not with `kv-resident`. DeepSeek: `fp8` rounds as the model's reference (FP8 window rows, FP4 compressed rows and index keys, 920 bytes per position); `fp16` keeps the unrounded values (3,200 bytes per position). A model refuses the other's values. |
-| `kv-resident` | engine | cells (min 20,480) or `0` | 0 | Flash-Next only. Keep N cells of KV in VRAM and the rest in pinned RAM. With `parallel` and `kv` `int8`, every slot streams its own K/V this way. |
-| `rope-scaling` | engine | `none`, `linear`, `yarn` | model's, else `none` | Flash-Next only. Extend past the trained length. Fixed for the run. |
-| `rope-scale` | engine | number | model's, else 1 | Flash-Next only. Factor for `linear` and `yarn`. |
-| `rope-freq-base`, `rope-freq-scale` | engine | number | 0 (model's own) | Flash-Next only. Raw RoPE values. Leave at 0 unless you know them. |
-| `yarn-orig-ctx`, `yarn-ext-factor`, `yarn-attn-factor`, `yarn-beta-fast`, `yarn-beta-slow` | engine | number | 0 (262144), auto, 1, 32, 1 | Flash-Next only. YaRN parameters, as in llama.cpp. |
+| `kv-resident` | engine | cells (Flash-Next: min 20,480) or `0` | 0 | Flash-Next and Qwen3.8-27B. Keep N cells of KV in VRAM and the rest in pinned RAM. Flash-Next: with `parallel` and `kv` `int8`, every slot streams its own K/V this way. Qwen3.8-27B: each attention layer keeps its first N positions on the card and every decoded token reads the rest over the bus, so decode slows with each one ([guide](../models/qwen38-27b.md#memory)); output is unchanged. |
+| `rope-scaling` | engine | `none`, `linear`, `yarn` | model's, else `none` | Flash-Next and Qwen3.8-27B. Extend past the trained length (Qwen3.8-27B: `--max-context` up to 262,144 x `rope-scale`). Fixed for the run, and it changes every position's rotation, short prompts too ([precision](../precision/qwen38-27b.md#context-past-262144)). |
+| `rope-scale` | engine | number | model's, else 1 | Flash-Next and Qwen3.8-27B. Factor for `linear` and `yarn`. |
+| `rope-freq-base`, `rope-freq-scale` | engine | number | 0 (model's own) | Flash-Next and Qwen3.8-27B. Raw RoPE values. Leave at 0 unless you know them. |
+| `yarn-orig-ctx`, `yarn-ext-factor`, `yarn-attn-factor`, `yarn-beta-fast`, `yarn-beta-slow` | engine | number | 0 (the model's 262144), auto, 1, 32, 1 | Flash-Next and Qwen3.8-27B. YaRN parameters, as in llama.cpp. |
 
 ## Expert cache and memory
 
@@ -174,7 +175,7 @@ Unless `relaxed-drafting` is on, output is exactly plain decoding's.
 | `image-url-host` | server | `HOST` or `HOST:PORT`, repeatable | none | Allow `http(s)` image URLs on this host from other machines. [image sources](image-sources.md) |
 | `image-dir` | server | directory, repeatable | none | Allow image files under this directory from other machines. [image sources](image-sources.md) |
 | `image-remote-only` | server | switch | off | Treat this machine's requests as remote too. [image sources](image-sources.md) |
-| `video-max-tokens` | entry | 64 to 65536 | 8192 | The most image tokens one video takes over all its frames. Video needs `vision` and FFmpeg 6, 7 or 8 on the machine. [running](../running.md#video) |
+| `video-max-tokens` | entry | 64 to 65536 | 8192 | The most image tokens one video takes over all its frames. Video needs `vision` and FFmpeg 6, 7, 8 or 9 on the machine. [running](../running.md#video) |
 
 Diagnostic flags: [diagnostics](diagnostics.md).
 
