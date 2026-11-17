@@ -5,6 +5,7 @@
 #include "decode_loop.hpp"
 #include "basalt/core/diag.hpp"
 #include "basalt/core/device.hpp"
+#include "basalt/core/on_device.hpp"
 #include "basalt/program/community_row.hpp"
 #include "basalt/program/conv_cache.hpp"
 #include "basalt/program/probe_rates.hpp"
@@ -172,7 +173,7 @@ public:
     }
     void sleep_command(bool down, std::string& e) override {
         std::string reply;
-        int64_t slots = 0;
+        int64_t slots = -1;
         if (const basalt::model::Result r = session().set_low_memory(down, slots); !r.ok()) {
             e = r.message;
             return;
@@ -300,9 +301,16 @@ public:
         }
         c.state_a.resize(rs.bytes());
         std::memcpy(c.state_a.data(), rs.head.data(), rs.head.size());
-        // the state is snapshotted on the device now and moves to the host while the request goes on
+        // the state is snapshotted on the device now and moves to the host while the request goes on (each card's part on
+        // its own device)
         const std::vector<basalt::core::SaveSegment> seg{{c.state_a.data() + rs.head.size(), rs.regions}};
         if (!ckd.save(seg, (cudaStream_t) rs.stream, c.state_a.data(), err)) return false;
+        if (!rs.peer_regions.empty()) {
+            const basalt::core::OnDevice on(rs.peer_device);
+            ckd_peer_dev = rs.peer_device;
+            const std::vector<basalt::core::SaveSegment> ps{{c.state_a.data() + rs.head.size() + rs.regions_bytes(), rs.peer_regions}};
+            if (!ckd_peer.save(ps, (cudaStream_t) rs.peer_stream, c.state_a.data(), err)) return false;
+        }
         keep_check(std::move(c));
         return true;
     }
@@ -314,8 +322,7 @@ public:
         to.resize(rs.bytes());
         std::memcpy(to.data(), rs.head.data(), rs.head.size());
         std::string e;
-        if (!basalt::core::checkpoint_copy_out({{to.data() + rs.head.size(), rs.regions}}, (cudaStream_t) rs.stream, e))
-            return {basalt::model::Status::Error, e};
+        if (!basalt::core::running_copy_out(rs, to.data(), e)) return {basalt::model::Status::Error, e};
         return {};
     }
     /// A checkpoint's or a parked conversation's running state back into the session.
@@ -324,8 +331,7 @@ public:
         if (const basalt::model::Result r = session().running_state(pos, false, rs); !r.ok()) return r;
         if (from.size() != rs.bytes()) return {basalt::model::Status::Error, "a checkpoint's running state has the wrong size"};
         std::string e;
-        if (!basalt::core::checkpoint_copy_in({{from.data() + rs.head.size(), rs.regions}}, (cudaStream_t) rs.stream, e))
-            return {basalt::model::Status::Error, e};
+        if (!basalt::core::running_copy_in(rs, from.data(), e)) return {basalt::model::Status::Error, e};
         return session().running_restored(pos, from.data());
     }
 
@@ -339,6 +345,13 @@ public:
         if (!basalt::core::CheckpointBytes::allocator_type::reserve(bytes, keep, &basalt::core::kCheckpointPin))
             basalt::log::warn("basalt serve", "checkpoint blocks not reserved: out of host memory");
         if (std::string e; !ckd.reserve(bytes, e)) basalt::log::warn("basalt serve", "deferred checkpoint copy off: %s", e.c_str());
+        basalt::core::RunningState rs;   // a split model's second card keeps a spare of its own part
+        if (session().running_state(0, false, rs).ok() && !rs.peer_regions.empty()) {
+            const basalt::core::OnDevice on(rs.peer_device);
+            ckd_peer_dev = rs.peer_device;
+            if (std::string e; !ckd_peer.reserve(basalt::core::RunningState::sum(rs.peer_regions), e))
+                basalt::log::warn("basalt serve", "deferred checkpoint copy off on the second card: %s", e.c_str());
+        }
     }
 
     basalt::model::ModelSession& session() { return *sessions_[(size_t) active_]; }
@@ -362,8 +375,10 @@ private:
         size_t free_b = 0, total_b = 0;
         cudaMemGetInfo(&free_b, &total_b);
         char line[160];
-        std::snprintf(line, sizeof line, "VRAM reserve_mib=%lld expert_slots=%lld vram_free_mib=%lld\n", reserve,
-                      (long long) slots, (long long) (free_b >> 20));
+        char held[48] = "";   // a session with no cache names no slots
+        if (slots >= 0) std::snprintf(held, sizeof held, " expert_slots=%lld", (long long) slots);
+        std::snprintf(line, sizeof line, "VRAM reserve_mib=%lld%s vram_free_mib=%lld\n", reserve, held,
+                      (long long) (free_b >> 20));
         if (reply != nullptr) *reply = line;
         else std::fputs(line, stdout);
         return true;
@@ -695,8 +710,8 @@ bool SessionRuntime::slot_window_finish(int b, SlotWin& w) {
 
 // The window's accepted drafts, grammar, logprobs and tokens; whether drafts follow (w.want).
 bool SessionRuntime::slot_window_accept(int b, SlotWin& w) {
-    std::vector<float> grammar_bias;
     std::vector<float> lp_rows;   // a logprobs slot's kept rows (row_logprobs)
+    bool grammar_dead = false;    // the grammar allowed no token: the slot ends as an error after this window
     const auto failed = [&](const std::string& m) {
         std::printf("ERR %s\n", m.c_str());
         set_active(0);
@@ -710,19 +725,35 @@ bool SessionRuntime::slot_window_accept(int b, SlotWin& w) {
     int a = 0;
     while (a < T - 1 && win_[(size_t) a + 1] == out_[(size_t) a]) ++a;
     if (sl.guard != nullptr && sl.guard->on()) {
-        // the first pick the grammar refuses is drawn again under its mask, and the window ends there
-        const int miss = sl.guard->scan(out_.data(), a + 1);
+        // the first pick the grammar refuses is drawn again under its mask, and the window ends there; with no token
+        // allowed at all the slot ends after it, as an error
+        const int miss = sl.guard->scan(out_.data(), a + 1, 0);
         if (miss >= 0) {
-            sl.guard->mask_bias({}, grammar_bias);
             int32_t y = -1;
-            if (const basalt::model::Result r = session().resample_row(miss, grammar_bias.data(), y); !r.ok()) return failed(r.message);
-            out_[(size_t) miss] = y;
+            std::string why;
+            const basalt::program::grammar::Redraw verdict = sl.guard->redraw(
+                {},
+                [&](const std::vector<float>& bias, int32_t& t) {
+                    const basalt::model::Result r = session().resample_row(miss, bias.data(), t);
+                    if (!r.ok()) why = r.message;
+                    return r.ok();
+                },
+                [&](std::vector<float>& lg) {
+                    lg.resize((size_t) n_vocab);
+                    const basalt::model::Result r = session().copy_logits(miss, lg.data());
+                    if (!r.ok()) why = r.message;
+                    return r.ok();
+                },
+                y);
+            if (verdict == basalt::program::grammar::Redraw::failed) return failed(why.empty() ? "the masked draw failed" : why);
+            if (verdict == basalt::program::grammar::Redraw::dead) grammar_dead = true;
+            else out_[(size_t) miss] = y;
             a = miss;
-            if (!sl.guard->take(y)) basalt::log::info("basalt grammar", "slot %d: the masked draw was token %d", b, (int) y);
         }
     }
     sl.drafts_offered += T - 1;
     sl.drafts_accepted += a;
+    ++sl.windows;
     std::string line = "BT " + std::to_string(b);
     const char* fin = nullptr;
     if (sl.lp_top >= 0) {   // the kept rows' logprobs, read before the drafts touch the head
@@ -744,6 +775,7 @@ bool SessionRuntime::slot_window_accept(int b, SlotWin& w) {
         const bool eos = std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) y) != o.eos_ids.end();
         fin = eos ? "stop" : sl.stop ? "cancel" : sl.produced >= sl.max_new || sl.p + 2 > o.max_context ? "length" : nullptr;
     }
+    if (grammar_dead) fin = "error";
     sl.n_dr = 0;
     w.a = a;
     w.line = line;
@@ -774,9 +806,9 @@ bool SessionRuntime::slot_window_end(int b, SlotWin& w) {
         else bpolicy->observe_window(w.chance, T, a, ms);
     }
     if (fin != nullptr) {
-        std::printf("BDONE %d %lld %s %.1f %lld %lld\n", b, (long long) sl.produced, fin,
+        std::printf("BDONE %d %lld %s %.1f %lld %lld %lld\n", b, (long long) sl.produced, fin,
                     std::chrono::duration<double, std::milli>(Clock::now() - sl.t0).count(),
-                    (long long) sl.drafts_accepted, (long long) sl.drafts_offered);
+                    (long long) sl.drafts_accepted, (long long) sl.drafts_offered, (long long) sl.windows);
         sl.active = false;
         sl.cached = o.prompt_cache > 0;
         sl.idle_busy = busy_now();

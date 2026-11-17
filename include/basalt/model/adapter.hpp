@@ -99,6 +99,8 @@ struct LoadRequest {
     std::string kv;                   ///< --kv: the KV storage as the model names it, checked by its flags (empty: default)
     RopeFlags rope;                   ///< the rope scaling flags, for a model that takes them (rope_flags.hpp)
     int64_t kv_resident = 0;          ///< --kv-resident: K/V cells per attention layer kept in VRAM (0: all)
+    std::vector<double> card_gbps;    ///< memory bandwidth of the main card, then of each peer device (GB/s, 0: unknown)
+    int diag_split_at = 0;            ///< diagnostic: a dense model's layers split at this one across two cards (0: off)
 };
 
 struct DecodeRequest {
@@ -183,7 +185,9 @@ public:
     virtual Result row_logprobs(int row0, int n, const int32_t* picks, int top, float* out) { (void) row0; (void) n; (void) picks; (void) top; (void) out; return {Status::NotImplemented, "this model keeps no logits"}; }
     /// The logits of row `row` of the last decoded window (n_vocab floats).
     virtual Result copy_logits(int row, float* out) { (void) row; (void) out; return {Status::NotImplemented, "this model keeps no logits"}; }
-    /// low: the VRAM the session can give back goes back to the driver; else it is taken again. The slots it holds now.
+    /// low: the VRAM the session can give back goes back to the driver; else it is taken again. The slots it holds now,
+    /// left at -1 by a session with no cache to lend (it answers ok and SLEEP goes on to the driver). Without this the
+    /// model cannot sleep.
     virtual Result set_low_memory(bool low, int64_t& expert_slots) { (void) low; (void) expert_slots; return {Status::NotImplemented, "this model cannot give VRAM back"}; }
     /// What the session leaves free on the main card from now on (`mib` < 0: the start's reserve), through prompts and
     /// images too; its VRAM use is resized to that now. The slots it holds now.
@@ -296,6 +300,12 @@ public:
     virtual int max_expert_cards() const = 0;
     /// A model with no experts to put on a second card reads long prompts there instead (a prompt line, not an expert tier).
     virtual bool second_card_reads_prompts() const { return false; }
+    /// Such a model with these flags does not fit its main card and splits its layers across the main card and the second
+    /// (a layer stage), given the two cards' memory bandwidth; asked once the run's cards are visible, before the load.
+    virtual bool second_card_runs_layers(const program::CommonOptions& o, double main_gbps, double peer_gbps) const {
+        (void) o; (void) main_gbps; (void) peer_gbps;
+        return false;
+    }
     virtual TokenNames token_names() const = 0;
     /// The pre-tokenizer's name in the pack's tokenizer.json and its rule.
     struct PreTokenizer {

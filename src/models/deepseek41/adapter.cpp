@@ -15,8 +15,11 @@
 #include "models/deepseek41/meta.hpp"
 #include "models/deepseek41/model.hpp"
 
+#include <cuda_runtime.h>
+
 #include <cstdint>
 #include <cstdlib>
+#include <vector>
 
 namespace basalt::models::deepseek41 {
 namespace {
@@ -47,8 +50,23 @@ public:
         m->set_diag_dump(req.diag_dump);
         m->set_diag_tier(req.diag_tier_ram, req.diag_tier_vram);
         m->set_tiers(req);
-        if (!req.peer_devices.empty()) m->set_peer_device(req.peer_devices.front());
-        if (req.peer_devices.size() > 1) basalt::log::warn("basalt deepseek41", "one second card holds experts; later cards idle");
+        std::vector<int> peers = req.peer_devices;
+        if (peers.size() > (size_t) kMaxSecondCards) {
+            basalt::log::warn("basalt deepseek41", "%zu second cards given, %d hold experts; later cards idle", peers.size(),
+                              kMaxSecondCards);
+            peers.resize((size_t) kMaxSecondCards);
+        }
+        // The peer-tier kernels of this architecture are built for sm_120 only: refuse an older
+        // peer card here rather than failing at its first launch with 'no kernel image'.
+        for (int dev : peers) {
+            cudaDeviceProp prop{};
+            if (cudaGetDeviceProperties(&prop, dev) == cudaSuccess && prop.major != 0 &&
+                !(prop.major == 12 && prop.minor == 0))
+                return {model::Status::Error,
+                        "deepseek41: GPU " + std::to_string(dev) + " (" + prop.name +
+                        ") is not sm_120: the DeepSeek peer-tier kernels are built for Blackwell only"};
+        }
+        m->set_peer_devices(std::move(peers));
         out = std::move(m);
         return {};
     }
@@ -81,7 +99,9 @@ public:
 
     PreTokenizer pretokenizer() const override { return {"joyai-llm", pretok_joyai}; }
 
-    int max_expert_cards() const override { return 1; }
+    /// Second cards that hold experts, each a contiguous block of layers.
+    static constexpr int kMaxSecondCards = 4;
+    int max_expert_cards() const override { return kMaxSecondCards; }
 
     const char* model_name() const override { return "DeepSeek-V4.1-Flash"; }
 
